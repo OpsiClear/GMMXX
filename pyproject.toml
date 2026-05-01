@@ -49,7 +49,8 @@ benchmark = [
 benchmark-gpu = [
   "numpy>=1.26",
   "scikit-learn>=1.5",
-  "torchgmm>=0.1.4"
+  "torchgmm>=0.1.4",
+  "tgmm>=0.2.0"
 ]
 dev = [
   "build>=1.2",

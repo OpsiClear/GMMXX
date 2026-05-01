@@ -1583,7 +1583,11 @@ def _kmeans_initialize(
 
     try:
         init_centroids = _kmeans_plus_plus_init_means(x, n_components)
-        if use_triton:
+    except Exception:
+        return None
+
+    if use_triton:
+        try:
             labels, means, _ = flash_kmeans.batch_kmeans_Euclid(
                 x,
                 n_components,
@@ -1592,17 +1596,24 @@ def _kmeans_initialize(
                 init_centroids=init_centroids,
                 verbose=verbose,
             )
+        except Exception:
+            pass
         else:
-            from flash_kmeans.torch_fallback import batch_kmeans_Euclid_torch_native
+            if labels.ndim == 1:
+                labels = labels.unsqueeze(0)
+            return labels.to(torch.long), means.to(dtype=x.dtype, device=x.device)
 
-            labels, means, _ = batch_kmeans_Euclid_torch_native(
-                x,
-                n_components,
-                max_iters=max_iters,
-                tol=tol,
-                init_centroids=init_centroids,
-                verbose=verbose,
-            )
+    try:
+        from flash_kmeans.torch_fallback import batch_kmeans_Euclid_torch_native
+
+        labels, means, _ = batch_kmeans_Euclid_torch_native(
+            x,
+            n_components,
+            max_iters=max_iters,
+            tol=tol,
+            init_centroids=init_centroids,
+            verbose=verbose,
+        )
     except Exception:
         return None
 

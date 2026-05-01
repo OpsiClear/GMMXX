@@ -4,6 +4,7 @@ import argparse
 import math
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -238,6 +239,47 @@ def _run_torchgmm(dataset: Dataset, args: argparse.Namespace, covariance_type: s
     )
 
 
+def _run_tgmm(dataset: Dataset, args: argparse.Namespace, covariance_type: str) -> Result:
+    try:
+        from tgmm import GaussianMixture as TGaussianMixture
+    except ImportError as exc:
+        raise RuntimeError("Install optional baseline first: python -m pip install tgmm") from exc
+
+    _, _, adjusted_rand_score, _, _ = _require_sklearn()
+    device = _resolve_device(args.device)
+    x = torch.as_tensor(dataset.x_np, device=device, dtype=torch.float32)
+
+    def fit_model() -> TGaussianMixture:
+        model = TGaussianMixture(
+            n_components=dataset.n_components,
+            n_features=x.shape[1],
+            covariance_type=covariance_type,
+            max_iter=args.max_iter,
+            tol=args.tol,
+            reg_covar=args.reg_covar,
+            n_init=1,
+            init_means=args.tgmm_init_means,
+            random_state=args.seed,
+            device=str(device),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return model.fit(x)
+
+    fit_seconds, model = _time_fit(device, fit_model, warmup_runs=args.warmup_runs)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        labels = model.predict(x).detach().cpu().numpy()
+        score = float(model.score(x))
+    return Result(
+        baseline=f"tgmm-{covariance_type}",
+        fit_seconds=fit_seconds,
+        score=score,
+        ari=_ari(dataset.labels_np, labels, adjusted_rand_score),
+        n_iter=int(getattr(model, "n_iter_", -1)),
+    )
+
+
 def _format_float(value: float | None, width: int, precision: int = 4) -> str:
     if value is None or (isinstance(value, float) and not math.isfinite(value)):
         return f"{'n/a':>{width}}"
@@ -283,6 +325,7 @@ def parse_args() -> argparse.Namespace:
         default="kmeans",
     )
     parser.add_argument("--torchgmm-init-strategy", default="kmeans")
+    parser.add_argument("--tgmm-init-means", default="kmeans")
     parser.add_argument("--matmul-precision", choices=["highest", "high", "medium"], default=None)
     parser.add_argument("--skip-fit-labels", action="store_true")
     parser.add_argument(
@@ -310,6 +353,10 @@ def parse_args() -> argparse.Namespace:
             "sklearn-full",
             "torchgmm-spherical",
             "torchgmm-diag",
+            "tgmm-spherical",
+            "tgmm-diag",
+            "tgmm-tied",
+            "tgmm-full",
         ],
     )
     return parser.parse_args()
@@ -390,6 +437,8 @@ def main() -> None:
                 results.append(_run_sklearn(dataset, args, baseline.removeprefix("sklearn-")))
             elif baseline.startswith("torchgmm-"):
                 results.append(_run_torchgmm(dataset, args, baseline.removeprefix("torchgmm-")))
+            elif baseline.startswith("tgmm-"):
+                results.append(_run_tgmm(dataset, args, baseline.removeprefix("tgmm-")))
         except Exception as exc:
             results.append(Result(baseline=baseline, fit_seconds=float("nan"), score=float("nan"), ari=None, n_iter=None, note=str(exc)))
 

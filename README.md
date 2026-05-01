@@ -194,6 +194,7 @@ Recommended baselines:
 - `sklearn-tied`: standard CPU baseline for tied covariance.
 - `sklearn-full`: standard CPU baseline for full covariance.
 - `torchgmm-spherical`: optional PyTorch Lightning GPU baseline from `torchgmm`; install separately with `python -m pip install torchgmm`.
+- `tgmm-spherical`, `tgmm-diag`, `tgmm-tied`, `tgmm-full`: optional PyTorch EM baselines from `tgmm`; install separately with `python -m pip install tgmm`.
 
 More implementation references are collected in `docs/high_performance_gmm_references.md`.
 
