@@ -1,26 +1,29 @@
 # GMMXX
 
-`GMMXX` is a PyTorch Gaussian Mixture Model package built with flash-kmeans-style streaming and Triton kernels.
+`GMMXX` is a PyTorch Gaussian Mixture Model package with flash-kmeans-style streaming, chunked EM updates, and Triton kernels for CUDA acceleration.
 
-Current scope:
+It exposes a scikit-learn-like estimator API while keeping GPU memory bounded by avoiding a materialized `(B, N, K)` responsibility tensor during fitting.
 
-- Spherical, diagonal, tied, and full-covariance GMM
-- Batched input support: `(B, N, D)` and `(N, D)`
-- Chunked PyTorch EM fallback that avoids materializing the full responsibility tensor during fitting
-- Optional `flash-kmeans` initialization when `flash-kmeans` is installed or available in a local `third_party/flash-kmeans` checkout
-- Copied-and-modified Triton kernels for spherical, diagonal, tied, and small-D full-covariance EM fitting on CUDA
-- Exact fused single-K-tile Triton E/M update for supported spherical, diagonal, and tied shapes
-- Optional approximate top-k EM training mode for very large component counts, with a fused Triton spherical path for supported CUDA shapes
-- Triton inference for spherical, diagonal, tied score/proba, and supported small-D full-covariance `predict`, `predict_proba`, and `score_samples`
+## Highlights
 
-The public estimator follows the familiar scikit-learn shape: `fit`, `predict`, `predict_proba`, `score`, `score_samples`, `aic`, `bic`, `get_params`, and `set_params`. The fastest path is still spherical covariance. Diagonal and tied covariance have streamed and fused Triton E/M paths for supported shapes; full covariance is intentionally conservative because its core cost scales as `N*K*D^2`.
+- Supports `covariance_type="spherical"`, `"diag"`, `"tied"`, and `"full"`.
+- Accepts both `(N, D)` and batched `(B, N, D)` inputs.
+- Provides `fit`, `predict`, `predict_proba`, `score`, `score_samples`, `aic`, `bic`, `get_params`, and `set_params`.
+- Uses validated Triton paths on CUDA where profitable, with automatic PyTorch/cuBLAS fallback.
+- Includes exact fused single-K-tile E/M updates for supported spherical, diagonal, and tied shapes.
+- Includes optional approximate top-k EM training for very large component counts.
+- Can use `flash-kmeans` initialization when installed or available under `third_party/flash-kmeans`.
 
-## Target stack
+The fastest path is spherical covariance. Diagonal and tied covariance have streamed and fused Triton E/M paths for supported shapes. Full covariance is intentionally conservative because its core update cost scales as `N*K*D^2`.
 
-- Python 3.12
-- PyTorch 2.11 / CUDA 13.0 wheels
-- Linux CUDA: `triton>=3.6,<3.7` (`import triton`)
-- Windows CUDA: `triton-windows>=3.6,<3.7` (`import triton`)
+## Requirements
+
+| Platform | Python | PyTorch | Triton package |
+| --- | --- | --- | --- |
+| Linux CUDA | `>=3.12` | `>=2.11` | `triton>=3.6,<3.7` |
+| Windows CUDA | `>=3.12` | `>=2.11` | `triton-windows>=3.6,<3.7` |
+
+The Python import is `triton` on both Linux and Windows. For CUDA 13.0, install the matching PyTorch wheel before installing `GMMXX`.
 
 ## Installation
 
@@ -30,14 +33,22 @@ Install from this checkout:
 python -m pip install -e .
 ```
 
-For CUDA 13.0, install the matching PyTorch 2.11 CUDA wheel first, then install
-`GMMXX`. The package metadata selects the Triton distribution by OS: upstream
-`triton` on Linux and `triton-windows` on Windows.
-
-Install with benchmark and sklearn helpers:
+Install benchmark and sklearn helpers:
 
 ```powershell
 python -m pip install -e ".[benchmark]"
+```
+
+Install optional external baselines:
+
+```powershell
+python -m pip install -e ".[benchmark-gpu]"
+```
+
+Install optional external `flash-kmeans` initialization support:
+
+```powershell
+python -m pip install ".[kmeans]"
 ```
 
 Build a wheel:
@@ -47,11 +58,7 @@ python -m pip install -e ".[dev]"
 python -m pip wheel . --no-deps -w dist
 ```
 
-The wheel contains the canonical `gmmxx` package. `third_party/` is kept as local reference code and is excluded from distributions. If you want `init_params="kmeans"` to use the external initializer after installing from a wheel, install `flash-kmeans` separately:
-
-```powershell
-python -m pip install ".[kmeans]"
-```
+The wheel contains the canonical `gmmxx` package. `third_party/` is reference code and is excluded from distributions.
 
 ## Quick Start
 
@@ -80,75 +87,60 @@ Learned attributes follow sklearn naming where practical:
 
 - `means_`, `weights_`, `covariances_`, `labels_`
 - `lower_bound_`, `lower_bound_history_`, `n_iter_`
-- runtime diagnostics such as `triton_estep_enabled_`, `triton_fused_update_enabled_`, `triton_approx_topk_enabled_`, and `last_fallback_reason_`
+- `triton_estep_enabled_`, `triton_fused_update_enabled_`, `triton_approx_topk_enabled_`, `last_fallback_reason_`
 
-Backward-compatible names are still supported: `d`, `k`, `niter`, and `seed` map to `n_features`, `n_components`, `max_iter`, and `random_state`.
+Backward-compatible constructor names are still supported: `d`, `k`, `niter`, and `seed` map to `n_features`, `n_components`, `max_iter`, and `random_state`.
 
-## Notes
+## Execution Model
 
-- On Linux, the Triton distribution is `triton`; on Windows, it is `triton-windows`. In both cases the Python import stays `triton`.
-- `covariance_type="spherical"` stores variances as `(B, K)` and uses the Triton path where profitable.
-- `covariance_type="diag"` stores diagonal variances as `(B, K, D)` and uses a Triton streamed E/M path for large CUDA shapes up to `D <= 64`, `K <= 512`.
-- `covariance_type="tied"` stores one shared covariance matrix as `(B, D, D)` and uses projected or native fused Triton E/M paths for large CUDA shapes up to `D <= 64`, `K <= 512`.
-- `covariance_type="full"` stores per-component covariance matrices as `(B, K, D, D)`. Full fit/update uses Triton only for profitable `D <= 8` shapes; full inference supports `D <= 16`.
-- `use_triton=True` is the single runtime switch. CUDA runs validated Triton paths where profitable; unsupported shapes and runtime compile/cache failures use PyTorch/cuBLAS automatically.
-- `fit()` avoids materializing full `(B, N, K)` responsibilities on all covariance types. Prediction/probability helpers use validated Triton paths for spherical, diagonal, tied score/proba, and supported small-D full covariance. Tied labels intentionally remain on the exact PyTorch path because projected logits can differ on near-tie assignments.
-- Fused E/M update is exact, not approximate. It is enabled internally when `K` fits one Triton K tile: spherical/tied currently support up to `D <= 64, K <= 128`; diagonal keeps the more conservative `D <= 64, K <= 64` high-dimensional tile.
-- `approx_top_k=N` is an explicit approximation for training only. Each E-step keeps the top `N` component logits per sample, normalizes responsibilities over that subset, and updates full sufficient statistics. `None` keeps exact EM, and values `>= K` are treated as exact. Spherical CUDA fits use a fused Triton top-k update for supported shapes; other shapes fall back to the PyTorch approximate path.
-- `matmul_precision="high"` or `"medium"` forwards to `torch.set_float32_matmul_precision(...)` before GMMXX operations. This is opt-in because it can change floating-point results slightly.
-- `compute_labels_on_fit=False` skips the final label assignment inside `fit()`. Use `fit_predict()` or `predict()` when labels are needed.
-- `init_params="kmeans"` uses greedy k-means++ seeding for moderate component counts before running the local `flash-kmeans` initializer. This improves clustering quality without adding another public init mode.
-- If Triton is installed but cannot compile or use its cache at runtime on Windows, the code falls back to the PyTorch path instead of failing the whole operation. The most recent recorded fallback is exposed as `GMMXX.last_fallback_reason_`.
-- The implementation targets all sklearn-style covariance types. Full covariance is intentionally conservative because each component needs matrix quadratic forms and second-moment reductions.
+Use `use_triton=True` as the single runtime switch. Unsupported shapes, compile failures, cache issues, and non-profitable cases automatically use the PyTorch/cuBLAS path. The most recent fallback reason is available as `GMMXX.last_fallback_reason_`.
 
-## Benchmarking
+`fit()` avoids materializing full `(B, N, K)` responsibilities for all covariance types. Prediction helpers use Triton for supported spherical, diagonal, tied score/proba, and small-D full covariance inference. Tied labels intentionally remain on the exact PyTorch path because projected logits can differ on near-tie assignments.
 
-Install the benchmark extras for the standard CPU baseline:
+### Covariance Coverage
 
-```powershell
-python -m pip install -e ".[benchmark]"
-```
+| Covariance | Parameter shape | CUDA/Triton coverage |
+| --- | --- | --- |
+| `spherical` | `(B, K)` | Fastest path. Exact fused E/M supports up to `D <= 64, K <= 128`; broader streamed/inference paths are used where profitable. |
+| `diag` | `(B, K, D)` | Streamed E/M supports large CUDA shapes up to `D <= 64, K <= 512`; exact fused high-D tile remains conservative at `D <= 64, K <= 64`. |
+| `tied` | `(B, D, D)` | Uses projected or native fused Triton E/M up to `D <= 64, K <= 512`; exact fused tile supports up to `D <= 64, K <= 128`. |
+| `full` | `(B, K, D, D)` | Fit/update uses Triton only for profitable `D <= 8` shapes; inference supports `D <= 16`. |
 
-Run a synthetic spherical benchmark:
+### Useful Options
 
-```powershell
-python benchmarks\benchmark_gmm.py --dataset blobs --n-samples 65536 --n-features 128 --n-components 64 --device cuda --baselines flash-auto flash-torch sklearn-spherical
-```
+| Option | Purpose |
+| --- | --- |
+| `init_params="kmeans"` | Uses greedy k-means++ seeding for moderate component counts before the local or installed `flash-kmeans` initializer. |
+| `approx_top_k=N` | Approximate training mode. Each E-step keeps the top `N` component logits per sample and normalizes over that subset. `None` keeps exact EM; values `>= K` are treated as exact. |
+| `compute_labels_on_fit=False` | Skips final label assignment during `fit()`. Use `fit_predict()` or `predict()` when labels are needed. |
+| `matmul_precision="high"` or `"medium"` | Forwards to `torch.set_float32_matmul_precision(...)`; opt-in because it can slightly change floating-point results. |
 
-Run the top-k approximate EM path for large component counts:
+Approximate top-k EM is training-only and should be quality-checked on your dataset before replacing exact EM.
+
+## Validation
+
+Run the unit tests:
 
 ```powershell
-python benchmarks\benchmark_gmm.py --dataset blobs --n-samples 65536 --n-features 32 --n-components 512 --device cuda --max-iter 2 --init-params random --skip-fit-labels --approx-top-k 16 --baselines flash-auto flash-torch
+python -m pytest tests -q
 ```
 
-Run a diagonal covariance benchmark:
-
-```powershell
-python benchmarks\benchmark_gmm.py --dataset anisotropic-blobs --n-samples 131072 --n-features 32 --n-components 64 --device cuda --baselines flash-diag flash-diag-torch sklearn-diag
-```
-
-Run all covariance baselines on a small full-covariance-friendly shape:
-
-```powershell
-python benchmarks\benchmark_gmm.py --dataset anisotropic-blobs --n-samples 131072 --n-features 8 --n-components 32 --device cuda --baselines flash-diag flash-diag-torch flash-tied flash-tied-torch flash-full flash-full-torch sklearn-diag sklearn-tied sklearn-full
-```
-
-Validate numerical equivalence before timing:
+Validate numerical equivalence against internal PyTorch paths and sklearn references:
 
 ```powershell
 python benchmarks\validate_equivalence.py --device cuda
 ```
 
-Run the low-level Triton module benchmark used for kernel tuning:
-
-```powershell
-python .autotune\bench_triton_modules.py --profile standard --repeats 7
-```
-
-Run the size-coverage sweep against the PyTorch path:
+Run the standard size sweep:
 
 ```powershell
 python benchmarks\validate_size_sweep.py --device cuda --profile standard
+```
+
+Run larger supported shapes and fallback boundaries:
+
+```powershell
+python benchmarks\validate_size_sweep.py --device cuda --profile large --warmup-runs 1
 ```
 
 Validate clustering quality on labeled synthetic datasets:
@@ -157,76 +149,107 @@ Validate clustering quality on labeled synthetic datasets:
 python benchmarks\validate_quality.py --device cuda
 ```
 
-Benchmark accuracy and likelihood quality without failing on low-ARI cases:
+Benchmark likelihood and clustering quality:
 
 ```powershell
 python benchmarks\benchmark_accuracy.py --device cuda --dataset anisotropic-blobs --n-samples 32768 --n-features 16 --n-components 16
 ```
 
-Add `--include-sklearn` for a CPU sklearn quality baseline, and add
-`--fail-on-low-ari` when you want the accuracy benchmark to behave like a
-regression gate.
+Add `--include-sklearn` for a CPU sklearn quality baseline. Add `--fail-on-low-ari` when the accuracy benchmark should behave like a regression gate.
 
-For larger supported shapes and fallback boundaries:
+## Benchmarking
+
+Install benchmark extras first:
 
 ```powershell
-python benchmarks\validate_size_sweep.py --device cuda --profile large --warmup-runs 1
+python -m pip install -e ".[benchmark]"
 ```
 
-For a custom grid:
+Common benchmark commands:
+
+```powershell
+# Spherical
+python benchmarks\benchmark_gmm.py --dataset blobs --n-samples 65536 --n-features 128 --n-components 64 --device cuda --baselines flash-auto flash-torch sklearn-spherical
+
+# Diagonal
+python benchmarks\benchmark_gmm.py --dataset anisotropic-blobs --n-samples 131072 --n-features 32 --n-components 64 --device cuda --baselines flash-diag flash-diag-torch sklearn-diag
+
+# Full-covariance-friendly shape
+python benchmarks\benchmark_gmm.py --dataset anisotropic-blobs --n-samples 131072 --n-features 8 --n-components 32 --device cuda --baselines flash-diag flash-diag-torch flash-tied flash-tied-torch flash-full flash-full-torch sklearn-diag sklearn-tied sklearn-full
+
+# Approximate top-k EM
+python benchmarks\benchmark_gmm.py --dataset blobs --n-samples 65536 --n-features 32 --n-components 512 --device cuda --max-iter 2 --init-params random --skip-fit-labels --approx-top-k 16 --baselines flash-auto flash-torch
+```
+
+Low-level Triton module benchmark:
+
+```powershell
+python .autotune\bench_triton_modules.py --profile standard --repeats 7
+```
+
+Custom size grid:
 
 ```powershell
 python benchmarks\validate_size_sweep.py --device cuda --cartesian --n-values 256,4096,65536 --d-values 1,32,64,128,129,256 --k-values 1,16,64,256,2048,2049
 ```
 
-Recommended baselines:
+### Baselines
 
-- `flash-auto`: this package with the default auto fit policy.
-- `flash-torch`: this package with `use_triton=False`; this isolates the value of the Triton path.
-- `flash-diag`: this package with `covariance_type="diag"`.
-- `flash-diag-torch`: this package with `covariance_type="diag"` and `use_triton=False`.
-- `flash-tied`: this package with `covariance_type="tied"`.
-- `flash-tied-torch`: this package with `covariance_type="tied"` and `use_triton=False`.
-- `flash-full`: this package with `covariance_type="full"`.
-- `flash-full-torch`: this package with `covariance_type="full"` and `use_triton=False`.
-- `sklearn-spherical`: `sklearn.mixture.GaussianMixture(covariance_type="spherical")`; this is the standard CPU correctness and quality baseline.
-- `sklearn-diag`: standard CPU baseline for diagonal covariance.
-- `sklearn-tied`: standard CPU baseline for tied covariance.
-- `sklearn-full`: standard CPU baseline for full covariance.
-- `torchgmm-spherical`: optional PyTorch Lightning GPU baseline from `torchgmm`; install separately with `python -m pip install torchgmm`.
-- `tgmm-spherical`, `tgmm-diag`, `tgmm-tied`, `tgmm-full`: optional PyTorch EM baselines from `tgmm`; install separately with `python -m pip install tgmm`.
+| Baseline | Meaning |
+| --- | --- |
+| `flash-auto` | GMMXX with the default auto CUDA policy. |
+| `flash-torch` | GMMXX with `use_triton=False`; isolates Triton speedup. |
+| `flash-diag`, `flash-tied`, `flash-full` | GMMXX with the corresponding covariance type. |
+| `flash-diag-torch`, `flash-tied-torch`, `flash-full-torch` | Same covariance type with `use_triton=False`. |
+| `sklearn-spherical`, `sklearn-diag`, `sklearn-tied`, `sklearn-full` | CPU sklearn correctness and quality baselines. |
+| `torchgmm-spherical` | Optional PyTorch Lightning GPU baseline from `torchgmm`. |
+| `tgmm-spherical`, `tgmm-diag`, `tgmm-tied`, `tgmm-full` | Optional PyTorch EM baselines from `tgmm`. |
 
-More implementation references are collected in `docs/high_performance_gmm_references.md`.
+Install external GPU baselines separately if needed:
 
-Recent local CUDA benchmark notes on RTX 4090, Python 3.12, `torch 2.11.0+cu130`, `triton-windows 3.6.0.post26`. Timings use warm caches and at least one warmup run, so first-time Triton compilation is excluded.
+```powershell
+python -m pip install torchgmm tgmm
+```
 
-- `N=524288, D=32, K=64, 2 iters`: `flash-auto 0.0192s`, `flash-torch 0.0571s`.
-- `N=524288, D=128, K=64, 2 iters`: `flash-auto 0.0448s`, `flash-torch 0.0596s`.
-- `N=1048576, D=32, K=64, 2 iters`: `flash-auto 0.0302s`, `flash-torch 0.1006s`.
-- `N=1048576, D=128, K=64, 2 iters`: sequential isolated run with two warmups: `flash-auto 0.0750s`, `flash-torch 0.1257s`.
-- `N=1048576, D=128, K=128, 2 iters`: sequential isolated run with two warmups: `flash-auto 0.0840s`, `flash-torch 0.1437s`.
-- `N=2097152, D=32, K=64, 2 iters`: `flash-auto 0.0786s`, `flash-torch 0.2306s`.
-- `N=2097152, D=128, K=64, 2 iters`: `flash-auto 0.2011s`, `flash-torch 0.2500s`.
-- Diagonal Triton fit benchmark on anisotropic blobs: `N=131072, D=32, K=64, 3 iters`: `flash-diag 0.0073s`, `flash-diag-torch 0.0097s`.
-- Tied Triton fit benchmark on anisotropic blobs: `N=131072, D=32, K=64, 3 iters`: `flash-tied 0.0107s`, `flash-tied-torch 0.0122s`.
-- Full small-D Triton fit benchmark on blobs: `N=131072, D=8, K=32, 3 iters`: `flash-full 0.0089s`, `flash-full-torch 0.0132s`.
-- Larger diagonal Triton fit benchmark on anisotropic blobs: `N=1048576, D=32, K=64, 3 iters`: `flash-diag 0.0284s`, `flash-diag-torch 0.0419s`.
-- Larger tied Triton fit benchmark on anisotropic blobs: `N=1048576, D=32, K=64, 3 iters`: `flash-tied 0.0289s`, `flash-tied-torch 0.0331s`.
-- Larger full small-D Triton fit benchmark on blobs: `N=1048576, D=8, K=32, 3 iters`: `flash-full 0.0330s`, `flash-full-torch 0.0689s`.
-- Diagonal covariance sanity benchmark on anisotropic blobs: `N=32768, D=32, K=16, 5 iters`: `flash-auto 0.0105s`, `flash-diag 0.0208s`, `sklearn-spherical 0.1328s`, `sklearn-diag 0.1310s`.
-- All-covariance sanity benchmark on anisotropic blobs: `N=32768, D=8, K=8, 5 iters`: `flash-diag 0.0178s`, `flash-tied 0.0209s`, `flash-full 0.0196s`, `sklearn-diag 0.0567s`, `sklearn-tied 0.1132s`, `sklearn-full 0.1418s`. This benchmark is not a quality-equivalence run because the libraries may initialize differently.
-- Larger all-covariance sanity benchmark on anisotropic blobs: `N=131072, D=8, K=8, 5 iters`: `flash-diag 0.0223s`, `flash-tied 0.0292s`, `flash-full 0.0261s`, `sklearn-diag 0.2796s`, `sklearn-tied 0.3837s`, `sklearn-full 0.5519s`.
-- Larger-K covariance sanity benchmark on anisotropic blobs: `N=65536, D=16, K=64, 3 iters`: `flash-diag 0.0100s`, `flash-tied 0.0135s`, `flash-full 0.0221s`.
-- External random-init comparison with `--batch-size 8192` for TorchGMM: `N=131072, D=128, K=64, 3 iters`: `flash-auto 0.0134s`, `torchgmm-spherical 0.1443s`, `sklearn-spherical 1.5874s`. This is a speed sanity check, not a strict quality-equivalence run, because each library initializes and parameterizes training differently.
-- Fused E/M update sanity benchmark on RTX 4090, random data, `N=131072`, `2 iters`, labels skipped: spherical `D=32,K=64` `2.29x` over `flash-torch`; spherical `D=32,K=128` `3.44x`; spherical `D=64,K=128` `2.11x`; diagonal `D=16,K=128` `2.71x`; tied `D=32,K=64` `3.44x`; tied `D=64,K=128` `1.09x`; full `D=8,K=32` streamed Triton `3.53x`.
-- Top-k approximate EM sanity benchmark on RTX 4090, blobs, `N=32768, D=32, K=512, 2 iters`, labels skipped, one warmup: `flash-auto approx_top_k=16` `0.0059s`, `flash-torch approx_top_k=16` `0.0226s` (`3.83x`). A random-data isolated timing measured `approx-triton` at about `19.8x` over the PyTorch approximate path and `21.8x` over exact PyTorch EM for the same shape. This is an approximate objective; compare quality for your dataset before using it as a replacement for exact EM.
+More implementation references are collected in [docs/high_performance_gmm_references.md](docs/high_performance_gmm_references.md).
 
-Datasets to use:
+### Local RTX 4090 Notes
 
-- `blobs`: synthetic isotropic Gaussian blobs from `sklearn.datasets.make_blobs`; best first speed and correctness benchmark for spherical GMM.
-- `anisotropic-blobs`: transformed Gaussian blobs; useful for showing where spherical GMM quality is expected to lose to diagonal/full covariance methods.
-- `iris`, `wine`, `digits`: small standard scikit-learn datasets for sanity checks and regression tests.
-- MNIST via OpenML is a useful larger public dataset, but it is not included in the local benchmark script yet because it requires network download and caching.
+Recent local CUDA notes were measured on RTX 4090, Python 3.12, `torch 2.11.0+cu130`, and `triton-windows 3.6.0.post26`. Timings use warm caches and exclude first-time Triton compilation.
+
+| Shape / benchmark | Result |
+| --- | --- |
+| `N=524288, D=32, K=64, 2 iters` | `flash-auto 0.0192s`, `flash-torch 0.0571s` |
+| `N=1048576, D=32, K=64, 2 iters` | `flash-auto 0.0302s`, `flash-torch 0.1006s` |
+| `N=1048576, D=128, K=64, 2 iters` | `flash-auto 0.0750s`, `flash-torch 0.1257s` |
+| `N=2097152, D=32, K=64, 2 iters` | `flash-auto 0.0786s`, `flash-torch 0.2306s` |
+| `N=2097152, D=128, K=64, 2 iters` | `flash-auto 0.2011s`, `flash-torch 0.2500s` |
+| Diagonal, `N=1048576, D=32, K=64, 3 iters` | `flash-diag 0.0284s`, `flash-diag-torch 0.0419s` |
+| Tied, `N=1048576, D=32, K=64, 3 iters` | `flash-tied 0.0289s`, `flash-tied-torch 0.0331s` |
+| Full, `N=1048576, D=8, K=32, 3 iters` | `flash-full 0.0330s`, `flash-full-torch 0.0689s` |
+| External TorchGMM, `N=131072, D=128, K=64, 3 iters` | `flash-auto 0.0134s`, `torchgmm-spherical 0.1443s`, `sklearn-spherical 1.5874s` |
+| Approx top-k, `N=32768, D=32, K=512, top_k=16, 2 iters` | `flash-auto 0.0059s`, `flash-torch 0.0226s` |
+
+Fused E/M update speedups over `flash-torch`, random data, `N=131072`, `2 iters`, labels skipped:
+
+| Mode | Shape | Speedup |
+| --- | --- | --- |
+| Spherical | `D=32, K=64` | `2.29x` |
+| Spherical | `D=32, K=128` | `3.44x` |
+| Spherical | `D=64, K=128` | `2.11x` |
+| Diagonal | `D=16, K=128` | `2.71x` |
+| Tied | `D=32, K=64` | `3.44x` |
+| Tied | `D=64, K=128` | `1.09x` |
+| Full streamed Triton | `D=8, K=32` | `3.53x` |
+
+These are speed sanity checks, not strict quality-equivalence runs, because external libraries may initialize and parameterize training differently.
+
+## Datasets
+
+- `blobs`: isotropic Gaussian blobs from `sklearn.datasets.make_blobs`; best first speed and correctness benchmark for spherical GMM.
+- `anisotropic-blobs`: transformed Gaussian blobs; useful for testing diagonal, tied, and full covariance behavior.
+- `iris`, `wine`, `digits`: small standard sklearn datasets for sanity checks and regression tests.
+- MNIST via OpenML is useful as a larger public dataset, but it is not included in the local benchmark script because it requires network download and caching.
 
 ## Acknowledgements
 
