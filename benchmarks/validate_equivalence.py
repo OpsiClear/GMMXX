@@ -13,8 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from flash_gmm2 import FlashGMM
-from flash_gmm2.torch_fallback import (
+from gmmxx import GMMXX
+from gmmxx.torch_fallback import (
     _compute_chunk_logits,
     batch_gmm_Diagonal_torch_native,
     batch_gmm_Full_torch_native,
@@ -96,7 +96,7 @@ def _kernel_equivalence(args: argparse.Namespace, device: torch.device) -> list[
         _record(checks, "kernel_equivalence.skipped_no_cuda", True)
         return checks
 
-    from flash_gmm2 import (
+    from gmmxx import (
         fused_single_tile_update_config,
         spherical_assign_triton,
         spherical_logsumexp_triton,
@@ -231,9 +231,9 @@ def _kernel_equivalence(args: argparse.Namespace, device: torch.device) -> list[
         _record(checks, "kernel.approx_topk_sum_x_sq_max_rel", _max_rel(sum_x_sq_approx_torch, sum_x_sq_approx), args.stats_rtol)
         _record(checks, "kernel.approx_topk_ll_max_abs", abs(float(ll_approx.item() - approx_log_norm.sum().item())), args.score_atol)
 
-    from flash_gmm2.assign_diag_triton import diag_logsumexp_triton
-    from flash_gmm2.assign_full_triton import full_assign_triton, full_logsumexp_triton, full_resp_triton
-    from flash_gmm2.weighted_update_triton import (
+    from gmmxx.assign_diag_triton import diag_logsumexp_triton
+    from gmmxx.assign_full_triton import full_assign_triton, full_logsumexp_triton, full_resp_triton
+    from gmmxx.weighted_update_triton import (
         triton_blocked_update_diag,
         triton_blocked_update_full,
         triton_blocked_update_tied_projected,
@@ -524,12 +524,12 @@ def _fit_equivalence(args: argparse.Namespace, device: torch.device) -> list[Che
         init_params="random",
         reg_covar=args.reg_covar,
     )
-    torch_model = FlashGMM(**common, use_triton=False).fit(x)
-    triton_model = FlashGMM(**common, use_triton=True).fit(x)
+    torch_model = GMMXX(**common, use_triton=False).fit(x)
+    triton_model = GMMXX(**common, use_triton=True).fit(x)
     labels_torch = torch_model.predict(x).detach().cpu().numpy()
     labels_triton = triton_model.predict(x).detach().cpu().numpy()
 
-    def compare(prefix: str, model: FlashGMM, labels) -> None:
+    def compare(prefix: str, model: GMMXX, labels) -> None:
         ari = float(adjusted_rand_score(labels_torch, labels))
         _record(checks, f"{prefix}.label_ari", 1.0 - ari, args.fit_ari_error)
         _record(checks, f"{prefix}.score_abs_diff", abs(float(torch_model.score(x)) - float(model.score(x))), args.fit_score_atol)
@@ -576,13 +576,13 @@ def _highdim_equivalence(args: argparse.Namespace, device: torch.device) -> list
         init_params="random",
         reg_covar=args.reg_covar,
     )
-    torch_model = FlashGMM(**common, use_triton=False).fit(x)
-    auto_model = FlashGMM(**common, use_triton=True).fit(x)
+    torch_model = GMMXX(**common, use_triton=False).fit(x)
+    auto_model = GMMXX(**common, use_triton=True).fit(x)
 
     labels_torch = torch_model.predict(x).detach().cpu().numpy()
     labels_auto = auto_model.predict(x).detach().cpu().numpy()
 
-    def compare(prefix: str, model: FlashGMM, labels) -> None:
+    def compare(prefix: str, model: GMMXX, labels) -> None:
         ari = float(adjusted_rand_score(labels_torch, labels))
         _record_info(checks, f"{prefix}.triton_estep_enabled", bool(model.triton_estep_enabled_))
         _record_info(checks, f"{prefix}.triton_labels_enabled", bool(getattr(model, "triton_labels_enabled_", False)))

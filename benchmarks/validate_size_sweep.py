@@ -13,8 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from flash_gmm2 import FlashGMM
-from flash_gmm2._runtime import triton_spherical_supported
+from gmmxx import GMMXX
+from gmmxx._runtime import triton_spherical_supported
 
 
 @dataclass(frozen=True)
@@ -124,7 +124,7 @@ def _make_data(case: SizeCase, device: torch.device, seed: int, cluster_std: flo
     return x + noise * cluster_std
 
 
-def _fit_timed(model: FlashGMM, x: torch.Tensor, device: torch.device) -> tuple[float, FlashGMM]:
+def _fit_timed(model: GMMXX, x: torch.Tensor, device: torch.device) -> tuple[float, GMMXX]:
     _sync(device)
     start = time.perf_counter()
     model.fit(x)
@@ -132,8 +132,8 @@ def _fit_timed(model: FlashGMM, x: torch.Tensor, device: torch.device) -> tuple[
     return time.perf_counter() - start, model
 
 
-def _new_model(case: SizeCase, args: argparse.Namespace, *, use_triton: bool) -> FlashGMM:
-    return FlashGMM(
+def _new_model(case: SizeCase, args: argparse.Namespace, *, use_triton: bool) -> GMMXX:
+    return GMMXX(
         d=case.d,
         k=case.k,
         niter=args.max_iter,
@@ -156,7 +156,7 @@ def _ari_error(labels_a: torch.Tensor, labels_b: torch.Tensor) -> float | None:
     return 1.0 - float(ari)
 
 
-def _path(model: FlashGMM) -> str:
+def _path(model: GMMXX) -> str:
     estep = "triton" if model.triton_estep_enabled_ else "torch"
     mstep = "triton" if model.triton_streaming_update_enabled_ else "torch"
     labels = "triton" if model.triton_labels_enabled_ else "torch"
@@ -250,7 +250,7 @@ def _print_results(results: list[CaseResult]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate FlashGMM size coverage against the torch path.")
+    parser = argparse.ArgumentParser(description="Validate GMMXX size coverage against the torch path.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--profile", choices=["auto", "smoke", "standard", "large"], default="auto")
     parser.add_argument("--cartesian", action="store_true", help="Use the Cartesian product of --n-values/--d-values/--k-values.")

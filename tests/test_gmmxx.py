@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from flash_gmm2 import (
-    FlashGMM,
+from gmmxx import (
+    GMMXX,
     batch_gmm_Diagonal,
     batch_gmm_Full,
     batch_gmm_Spherical,
@@ -13,13 +13,13 @@ from flash_gmm2 import (
     triton_fused_single_tile_update_spherical,
     triton_fused_single_tile_update_tied_native,
 )
-from flash_gmm2._runtime import triton_spherical_supported
-from flash_gmm2.large_n import (
+from gmmxx._runtime import triton_spherical_supported
+from gmmxx.large_n import (
     large_n_predict_cpu,
     large_n_predict_proba_cpu,
     large_n_score_samples_cpu,
 )
-from flash_gmm2.torch_fallback import (
+from gmmxx.torch_fallback import (
     _compute_chunk_logits,
     _compute_diag_chunk_logits,
     _compute_tied_chunk_logits,
@@ -30,10 +30,9 @@ from flash_gmm2.torch_fallback import (
     tied_predict_proba_torch_native_chunked,
     tied_score_samples_torch_native_chunked,
 )
-from gmmxx import GMMXX
 
 
-class FlashGMMTests(unittest.TestCase):
+class GMMXXTests(unittest.TestCase):
     def test_runtime_gate_policy(self):
         self.assertFalse(triton_spherical_supported(0, 64))
         self.assertFalse(triton_spherical_supported(128, 0))
@@ -77,7 +76,7 @@ class FlashGMMTests(unittest.TestCase):
             dim=0,
         )
 
-        model = FlashGMM(
+        model = GMMXX(
             d=3,
             k=2,
             niter=25,
@@ -114,7 +113,7 @@ class FlashGMMTests(unittest.TestCase):
             dim=0,
         )
 
-        model = FlashGMM(
+        model = GMMXX(
             n_components=2,
             max_iter=4,
             random_state=10,
@@ -145,8 +144,8 @@ class FlashGMMTests(unittest.TestCase):
         self.assertEqual(model.covariance_type, "spherical")
         self.assertIsNone(model.means_)
 
-    def test_gmmxx_public_alias(self):
-        self.assertIs(GMMXX, FlashGMM)
+    def test_gmmxx_public_estimator(self):
+        self.assertEqual(GMMXX.__name__, "GMMXX")
 
     def test_approx_topk_em_all_covariance_shapes(self):
         torch.manual_seed(11)
@@ -164,7 +163,7 @@ class FlashGMMTests(unittest.TestCase):
         )
 
         for covariance_type in ["spherical", "diag", "tied", "full"]:
-            model = FlashGMM(
+            model = GMMXX(
                 d=3,
                 k=4,
                 niter=3,
@@ -199,7 +198,7 @@ class FlashGMMTests(unittest.TestCase):
 
     def test_invalid_approx_topk_rejected(self):
         with self.assertRaises(ValueError):
-            FlashGMM(d=2, k=2, approx_top_k=0)
+            GMMXX(d=2, k=2, approx_top_k=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for Triton approximate top-k EM")
     def test_spherical_approx_topk_triton_matches_torch(self):
@@ -220,8 +219,8 @@ class FlashGMMTests(unittest.TestCase):
             "approx_top_k": 8,
             "device": torch.device("cuda"),
         }
-        triton_model = FlashGMM(use_triton=True, **common_kwargs).fit(x)
-        torch_model = FlashGMM(use_triton=False, **common_kwargs).fit(x)
+        triton_model = GMMXX(use_triton=True, **common_kwargs).fit(x)
+        torch_model = GMMXX(use_triton=False, **common_kwargs).fit(x)
 
         self.assertTrue(triton_model.triton_approx_topk_enabled_)
         self.assertFalse(torch_model.triton_approx_topk_enabled_)
@@ -268,7 +267,7 @@ class FlashGMMTests(unittest.TestCase):
             dim=0,
         )
 
-        model = FlashGMM(
+        model = GMMXX(
             d=4,
             k=2,
             niter=12,
@@ -353,7 +352,7 @@ class FlashGMMTests(unittest.TestCase):
         )
 
         for covariance_type, expected_cov_shape in [("tied", (1, 3, 3)), ("full", (1, 2, 3, 3))]:
-            model = FlashGMM(
+            model = GMMXX(
                 d=3,
                 k=2,
                 niter=4,
@@ -394,7 +393,7 @@ class FlashGMMTests(unittest.TestCase):
         ).contiguous()
 
         for covariance_type in ["spherical", "diag", "tied", "full"]:
-            model = FlashGMM(
+            model = GMMXX(
                 d=3,
                 k=2,
                 niter=3,
@@ -439,7 +438,7 @@ class FlashGMMTests(unittest.TestCase):
         ).contiguous()
         x_gpu = x.cuda()
 
-        diag_model = FlashGMM(
+        diag_model = GMMXX(
             d=16,
             k=4,
             niter=3,
@@ -476,7 +475,7 @@ class FlashGMMTests(unittest.TestCase):
         self.assertTrue(torch.allclose(diag_probs, diag_ref_probs, atol=1e-4, rtol=1e-4))
         self.assertTrue(torch.allclose(diag_scores, diag_ref_scores, atol=1e-4, rtol=1e-4))
 
-        tied_model = FlashGMM(
+        tied_model = GMMXX(
             d=16,
             k=4,
             niter=3,

@@ -1,6 +1,6 @@
 # High-Performance GMM References
 
-This list is scoped to implementations and papers that are useful for `GMMXX`, which is an EM-based GMM clustering package. It excludes the unrelated learned-compression `FlashGMM` project as an implementation baseline.
+This list is scoped to implementations and papers that are useful for `GMMXX`, which is an EM-based GMM clustering package. It excludes unrelated learned-compression projects with similar naming as implementation baselines.
 
 ## Best Baseline Candidates
 

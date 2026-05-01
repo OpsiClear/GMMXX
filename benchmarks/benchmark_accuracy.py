@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from flash_gmm2 import FlashGMM
+from gmmxx import GMMXX
 
 
 @dataclass
@@ -101,8 +101,8 @@ def _run_flash(
     device = _resolve_device(args.device)
     x = torch.as_tensor(x_np, device=device, dtype=torch.float32)
 
-    def fit_model() -> FlashGMM:
-        model = FlashGMM(
+    def fit_model() -> GMMXX:
+        model = GMMXX(
             d=x.shape[1],
             k=n_components,
             niter=args.max_iter,

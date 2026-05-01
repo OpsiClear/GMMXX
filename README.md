@@ -42,7 +42,7 @@ python -m pip install -e ".[dev]"
 python -m build
 ```
 
-The wheel contains the canonical `gmmxx` package plus the backwards-compatible `flash_gmm2` implementation package. `third_party/` is kept as local reference code and is excluded from distributions. If you want `init_params="kmeans"` to use the external initializer after installing from a wheel, install `flash-kmeans` separately:
+The wheel contains the canonical `gmmxx` package. `third_party/` is kept as local reference code and is excluded from distributions. If you want `init_params="kmeans"` to use the external initializer after installing from a wheel, install `flash-kmeans` separately:
 
 ```powershell
 python -m pip install ".[kmeans]"

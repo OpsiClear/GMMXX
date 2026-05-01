@@ -109,7 +109,7 @@ def _resolve_alias(
     return primary if primary is not None else alias
 
 
-class FlashGMM:
+class GMMXX:
     """
     Flash-kmeans-style interface for Gaussian Mixture Models.
 
@@ -530,7 +530,7 @@ class FlashGMM:
         }
         for raw_name, value in params.items():
             if raw_name not in valid:
-                raise ValueError(f"Invalid parameter {raw_name!r} for FlashGMM")
+                raise ValueError(f"Invalid parameter {raw_name!r} for GMMXX")
             name = _SKLEARN_PARAM_ALIASES.get(raw_name, raw_name)
             if name == "d":
                 value = _optional_positive_int(value, "d")
