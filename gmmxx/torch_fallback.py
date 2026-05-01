@@ -1975,6 +1975,16 @@ def batch_gmm_Spherical_torch_native(
     if effective_approx_top_k is not None:
         gmm_use_triton_estep_enabled = False
         gmm_use_triton_streaming_update_enabled = False
+    spherical_fused_config = (
+        fused_single_tile_update_config(d, n_components, "spherical")
+        if (
+            _HAS_TRITON_FUSED_UPDATE
+            and x.is_cuda
+            and (gmm_use_triton_estep != False or gmm_use_triton_streaming_update != False)
+            and effective_approx_top_k is None
+        )
+        else None
+    )
     x_sq_all = (x.to(torch.float32) ** 2).sum(dim=-1)
     means, variances, weights, init_source = _initialize_parameters(
         x,
@@ -2030,11 +2040,14 @@ def batch_gmm_Spherical_torch_native(
         approx_partial_ll_buffer = torch.empty((bsz, max_n_blocks), device=x.device, dtype=torch.float32)
     blocked_partial_buffers = None
     if (
-        gmm_use_triton_streaming_update_enabled
+        (gmm_use_triton_streaming_update_enabled or spherical_fused_config is not None)
         and triton_spherical_supported(d, n_components)
         and x.is_cuda
     ):
-        blocked_block_n, _, _ = _triton_blocked_update_config(d, n_components)
+        if spherical_fused_config is None:
+            blocked_block_n, _, _ = _triton_blocked_update_config(d, n_components)
+        else:
+            blocked_block_n = int(spherical_fused_config["BLOCK_N"])
         max_chunk_n = min(effective_chunk_size_N, n)
         max_n_blocks = (max_chunk_n + blocked_block_n - 1) // blocked_block_n
         blocked_partial_buffers = (
@@ -2066,7 +2079,12 @@ def batch_gmm_Spherical_torch_native(
         )
         means_sq = (
             (means.to(torch.float32) ** 2).sum(dim=-1)
-            if (use_triton_estep or use_triton_streaming_update or approx_triton_config is not None)
+            if (
+                use_triton_estep
+                or use_triton_streaming_update
+                or spherical_fused_config is not None
+                or approx_triton_config is not None
+            )
             else None
         )
 
@@ -2124,16 +2142,7 @@ def batch_gmm_Spherical_torch_native(
                     total_log_likelihood=total_log_likelihood,
                 )
                 continue
-            fused_config = (
-                fused_single_tile_update_config(d, n_components)
-                if (
-                    use_triton_streaming_update
-                    and _HAS_TRITON_FUSED_UPDATE
-                    and x.is_cuda
-                )
-                else None
-            )
-            if fused_config is not None:
+            if spherical_fused_config is not None:
                 try:
                     means_sq_for_update = means_sq
                     if means_sq_for_update is None:
@@ -2151,7 +2160,7 @@ def batch_gmm_Spherical_torch_native(
                             partial_sum_x=None if blocked_partial_buffers is None else blocked_partial_buffers[1],
                             partial_sum_x_sq=None if blocked_partial_buffers is None else blocked_partial_buffers[2],
                             partial_log_likelihood=None if blocked_partial_buffers is None else blocked_partial_buffers[3],
-                            **fused_config,
+                            **spherical_fused_config,
                         )
                     )
                     total_log_likelihood = total_log_likelihood + ll_tile
@@ -2163,6 +2172,7 @@ def batch_gmm_Spherical_torch_native(
                 except Exception:
                     triton_streaming_update_failed = True
                     use_triton_streaming_update = False
+                    spherical_fused_config = None
 
             log_norm_already_summed = False
             if use_triton_estep:
@@ -2518,7 +2528,7 @@ def batch_gmm_Diagonal_torch_native(
             if diag_use_triton:
                 try:
                     fused_config = (
-                        fused_single_tile_update_config(d, n_components)
+                        fused_single_tile_update_config(d, n_components, "diag")
                         if (_HAS_TRITON_FUSED_UPDATE and x.is_cuda)
                         else None
                     )
@@ -2840,7 +2850,7 @@ def _batch_gmm_matrix_torch_native(
         tied_means_projected = None
         tied_means_projected_sq = None
         tied_fused_config = (
-            fused_single_tile_update_config(d, n_components)
+            fused_single_tile_update_config(d, n_components, "tied")
             if (
                 tied_use_triton
                 and _HAS_TRITON_FUSED_UPDATE

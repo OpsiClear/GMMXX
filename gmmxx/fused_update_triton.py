@@ -5,10 +5,16 @@ import triton
 import triton.language as tl
 
 
-def fused_single_tile_update_config(d: int, k: int) -> dict[str, int] | None:
+def fused_single_tile_update_config(
+    d: int,
+    k: int,
+    covariance_type: str | None = None,
+) -> dict[str, int] | None:
     """Shape policy for exact one-K-tile fused E/M updates."""
     if k <= 0 or d <= 0:
         return None
+    if covariance_type in {"spherical", "tied"} and d <= 64 and k <= 128:
+        return {"BLOCK_N": 64, "BLOCK_D": 64, "BLOCK_K": 128}
     if d <= 16 and k <= 128:
         return {"BLOCK_N": 64, "BLOCK_D": 16, "BLOCK_K": 128}
     if d <= 32 and k <= 128:

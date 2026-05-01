@@ -614,6 +614,16 @@ class GMMXXTests(unittest.TestCase):
         log_weights = torch.log(weights)
         config = fused_single_tile_update_config(d, k)
         self.assertIsNotNone(config)
+        self.assertIsNone(fused_single_tile_update_config(64, 128))
+        self.assertIsNone(fused_single_tile_update_config(64, 128, "diag"))
+        self.assertEqual(
+            fused_single_tile_update_config(64, 128, "spherical"),
+            {"BLOCK_N": 64, "BLOCK_D": 64, "BLOCK_K": 128},
+        )
+        self.assertEqual(
+            fused_single_tile_update_config(64, 128, "tied"),
+            {"BLOCK_N": 64, "BLOCK_D": 64, "BLOCK_K": 128},
+        )
 
         variances = torch.rand(bsz, k, device="cuda") + 0.5
         x_sq = x.square().sum(dim=-1)
@@ -705,6 +715,66 @@ class GMMXXTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(nk, nk_ref, atol=1e-3, rtol=1e-4))
         self.assertTrue(torch.allclose(sum_x, sum_x_ref, atol=1e-3, rtol=1e-4))
+        self.assertLess(abs(float(ll.item() - log_norm.sum().item())), 5e-3)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for D64/K128 fused update kernels")
+    def test_fused_update_d64_k128_spherical_and_tied_match_torch(self):
+        if triton_fused_single_tile_update_spherical is None:
+            self.skipTest("Triton fused update kernels unavailable")
+        torch.manual_seed(13)
+        bsz, n, d, k = 1, 48, 64, 128
+        x = torch.randn(bsz, n, d, device="cuda")
+        means = torch.randn(bsz, k, d, device="cuda")
+        weights = torch.softmax(torch.randn(bsz, k, device="cuda"), dim=-1)
+        log_weights = torch.log(weights)
+        config = fused_single_tile_update_config(d, k, "spherical")
+        self.assertIsNotNone(config)
+
+        variances = torch.rand(bsz, k, device="cuda") + 0.5
+        x_sq = x.square().sum(dim=-1)
+        means_sq = means.square().sum(dim=-1)
+        logits = _compute_chunk_logits(x, x_sq, means, variances, log_weights)
+        log_norm = torch.logsumexp(logits, dim=-1)
+        resp = torch.exp(logits - log_norm.unsqueeze(-1))
+        nk_ref = resp.sum(dim=1)
+        sum_x_ref = torch.bmm(resp.transpose(1, 2), x)
+        sum_x_sq_ref = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
+        nk, sum_x, sum_x_sq, ll = triton_fused_single_tile_update_spherical(
+            x,
+            means,
+            variances,
+            weights,
+            x_sq=x_sq,
+            means_sq=means_sq,
+            log_weights=log_weights,
+            **config,
+        )
+        self.assertTrue(torch.allclose(nk, nk_ref, atol=1e-4, rtol=1e-4))
+        self.assertTrue(torch.allclose(sum_x, sum_x_ref, atol=1e-4, rtol=1e-4))
+        self.assertTrue(torch.allclose(sum_x_sq, sum_x_sq_ref, atol=1e-3, rtol=1e-4))
+        self.assertLess(abs(float(ll.item() - log_norm.sum().item())), 5e-3)
+
+        tied_config = fused_single_tile_update_config(d, k, "tied")
+        chol_precision = torch.eye(d, device="cuda").expand(bsz, d, d).contiguous()
+        means_projected = means.contiguous()
+        means_projected_sq = means_projected.square().sum(dim=-1)
+        unit_variances = torch.ones_like(weights)
+        logits = _compute_chunk_logits(x, x_sq, means_projected, unit_variances, log_weights)
+        log_norm = torch.logsumexp(logits, dim=-1)
+        resp = torch.exp(logits - log_norm.unsqueeze(-1))
+        nk_ref = resp.sum(dim=1)
+        sum_x_ref = torch.bmm(resp.transpose(1, 2), x)
+        nk, sum_x, ll = triton_fused_single_tile_update_tied_native(
+            x,
+            chol_precision,
+            means_projected,
+            means_projected_sq,
+            torch.zeros(bsz, device="cuda"),
+            log_weights,
+            **tied_config,
+        )
+        self.assertTrue(torch.allclose(nk, nk_ref, atol=1e-4, rtol=1e-4))
+        self.assertTrue(torch.allclose(sum_x, sum_x_ref, atol=1e-4, rtol=1e-4))
         self.assertLess(abs(float(ll.item() - log_norm.sum().item())), 5e-3)
 
 

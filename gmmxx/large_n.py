@@ -576,7 +576,7 @@ def batch_gmm_largeN_cpu(
         if covariance_type == "spherical" and (use_triton or approx_triton_config is not None):
             means_sq = means.to(torch.float32).square().sum(dim=-1)
         fused_update_config = (
-            fused_single_tile_update_config(d, n_components)
+            fused_single_tile_update_config(d, n_components, covariance_type)
             if use_triton
             else None
         )
