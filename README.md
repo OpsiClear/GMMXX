@@ -19,7 +19,8 @@ The public estimator follows the familiar scikit-learn shape: `fit`, `predict`, 
 
 - Python 3.12
 - PyTorch 2.11 / CUDA 13.0 wheels
-- Windows: `triton-windows` 3.6 (`import triton`)
+- Linux CUDA: `triton>=3.6,<3.7` (`import triton`)
+- Windows CUDA: `triton-windows>=3.6,<3.7` (`import triton`)
 
 ## Installation
 
@@ -29,17 +30,21 @@ Install from this checkout:
 python -m pip install -e .
 ```
 
+For CUDA 13.0, install the matching PyTorch 2.11 CUDA wheel first, then install
+`GMMXX`. The package metadata selects the Triton distribution by OS: upstream
+`triton` on Linux and `triton-windows` on Windows.
+
 Install with benchmark and sklearn helpers:
 
 ```powershell
 python -m pip install -e ".[benchmark]"
 ```
 
-Build a wheel and source distribution:
+Build a wheel:
 
 ```powershell
 python -m pip install -e ".[dev]"
-python -m build
+python -m pip wheel . --no-deps -w dist
 ```
 
 The wheel contains the canonical `gmmxx` package. `third_party/` is kept as local reference code and is excluded from distributions. If you want `init_params="kmeans"` to use the external initializer after installing from a wheel, install `flash-kmeans` separately:
@@ -81,7 +86,7 @@ Backward-compatible names are still supported: `d`, `k`, `niter`, and `seed` map
 
 ## Notes
 
-- On Windows, the distribution name is `triton-windows`, while the Python import stays `triton`.
+- On Linux, the Triton distribution is `triton`; on Windows, it is `triton-windows`. In both cases the Python import stays `triton`.
 - `covariance_type="spherical"` stores variances as `(B, K)` and uses the Triton path where profitable.
 - `covariance_type="diag"` stores diagonal variances as `(B, K, D)` and uses a Triton streamed E/M path for large CUDA shapes up to `D <= 64`, `K <= 512`.
 - `covariance_type="tied"` stores one shared covariance matrix as `(B, D, D)` and uses projected or native fused Triton E/M paths for large CUDA shapes up to `D <= 64`, `K <= 512`.
