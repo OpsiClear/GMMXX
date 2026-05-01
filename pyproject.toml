@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "GMMXX"
+version = "0.1.0"
+description = "GPU-friendly Gaussian Mixture Models with chunked PyTorch and Triton EM paths"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "OpenAI Codex" }
+]
+license = { file = "LICENSE" }
+keywords = ["gmm", "gaussian-mixture", "clustering", "pytorch", "flash-kmeans"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Typing :: Typed",
+]
+dependencies = [
+  "torch>=2.11",
+  "triton-windows>=3.6,<3.7; platform_system == 'Windows'",
+  "triton; platform_system != 'Windows'"
+]
+
+[project.urls]
+Homepage = "https://github.com/OpsiClear/GMMXX"
+Source = "https://github.com/OpsiClear/GMMXX"
+Issues = "https://github.com/OpsiClear/GMMXX/issues"
+
+[project.optional-dependencies]
+sklearn = [
+  "numpy>=1.26",
+  "scikit-learn>=1.5"
+]
+kmeans = [
+  "flash-kmeans>=0.2"
+]
+benchmark = [
+  "numpy>=1.26",
+  "scikit-learn>=1.5"
+]
+benchmark-gpu = [
+  "numpy>=1.26",
+  "scikit-learn>=1.5",
+  "torchgmm>=0.1.4"
+]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "twine>=5"
+]
+
+[tool.setuptools]
+packages = ["flash_gmm2", "gmmxx"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+flash_gmm2 = ["py.typed"]
+gmmxx = ["py.typed"]

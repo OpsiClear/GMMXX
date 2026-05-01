@@ -1,0 +1,19 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include flash_gmm2/py.typed
+include gmmxx/py.typed
+
+recursive-include flash_gmm2 *.py
+recursive-include gmmxx *.py
+
+prune .autotune
+prune .pytest_cache
+prune .tmp
+prune .triton-cache
+prune benchmarks
+prune docs
+prune tests
+prune third_party
+
+global-exclude __pycache__ *.py[cod] *.pyd *.so *.dll
