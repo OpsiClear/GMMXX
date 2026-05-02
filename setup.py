@@ -68,6 +68,12 @@ def _common_nvcc_flags() -> list[str]:
     ]
     if os.name == "nt":
         # CCCL in CUDA 13 requires the conforming MSVC preprocessor.
+        # /DNOMINMAX — prevent windows.h from defining min/max macros.
+        # /Usmall — rpcndr.h (pulled in by cuda_runtime.h on Windows) defines
+        #   `small` as `char`; ATen/c10 use `small` as a parameter name so
+        #   the substitution mangles e.g. `bool small` -> `bool char`.
+        #   Passing -Usmall via -Xcompiler undefines it at the MSVC level so it
+        #   never reaches ATen headers, regardless of include order.
         flags += ["-Xcompiler=/Zc:preprocessor"]
     else:
         flags.append("-Xcompiler=-fPIC")
