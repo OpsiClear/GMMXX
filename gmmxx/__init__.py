@@ -99,6 +99,8 @@ except Exception:
     triton_fused_single_tile_update_spherical = None
     triton_fused_single_tile_update_tied_native = None
 
+from . import cuda_ops as cuda_ops  # noqa: F401  -- experimental public surface
+
 __all__ = [
     "batch_gmm_Spherical",
     "batch_gmm_Spherical_torch_native",
@@ -148,6 +150,7 @@ __all__ = [
     "triton_fused_single_tile_update_tied_native",
     "approx_topk_update_spherical_config",
     "triton_approx_topk_update_spherical",
+    "cuda_ops",
 ]
 
 __version__ = "0.1.0"
