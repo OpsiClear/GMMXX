@@ -65,6 +65,7 @@ from .large_n import (
 
 
 _VALID_COVARIANCE_TYPES = {"spherical", "diag", "tied", "full"}
+_VALID_BACKENDS = {"auto", "cuda", "triton", "torch"}
 _COVARIANCE_ALIASES = {"diagonal": "diag"}
 _SKLEARN_PARAM_ALIASES = {
     "n_components": "k",
@@ -131,7 +132,7 @@ class GMMXX:
         k: Optional[int] = None,
         niter: Optional[int] = None,
         tol: float = 1e-4,
-        use_triton: bool = True,
+        use_triton: Optional[bool] = None,  # deprecated; see below
         seed: Optional[int] = None,
         chunk_size_data: int = 32768,
         chunk_size_centroids: int = 1024,
@@ -151,11 +152,39 @@ class GMMXX:
         max_iter: Optional[int] = None,
         random_state: Optional[int] = None,
         n_features: Optional[int] = None,
+        backend: str = "auto",
     ):
         d = _resolve_alias(d, n_features, primary_name="d", alias_name="n_features")
         k = _resolve_alias(k, n_components, primary_name="k", alias_name="n_components")
         niter = _resolve_alias(niter, max_iter, primary_name="niter", alias_name="max_iter")
         seed = _resolve_alias(seed, random_state, primary_name="seed", alias_name="random_state")
+
+        # Backend selection + use_triton deprecation shim.
+        # use_triton=True  -> backend="auto",  _legacy_no_triton=False
+        # use_triton=False -> backend="auto",  _legacy_no_triton=True
+        # If the user passes both backend= and use_triton=, raise.
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend!r}")
+        if use_triton is not None:
+            import warnings as _warnings
+            if backend != "auto":
+                # User passed both. Conflict.
+                raise ValueError(
+                    "Cannot pass both backend= and use_triton= to GMMXX. "
+                    "Drop use_triton; backend= is the canonical kwarg."
+                )
+            _warnings.warn(
+                "use_triton is deprecated; use backend='auto'|'cuda'|'triton'|'torch' instead. "
+                "use_triton=True maps to backend='auto'; use_triton=False maps to backend='auto' "
+                "with Triton filtered from the dispatch chain.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._legacy_no_triton = (use_triton is False)
+        else:
+            self._legacy_no_triton = False
+        self.backend = backend
+
         if k is None:
             raise ValueError("k or n_components is required")
 
@@ -165,7 +194,8 @@ class GMMXX:
         self.tol = float(tol)
         if self.tol < 0.0:
             raise ValueError("tol must be non-negative")
-        self.use_triton = bool(use_triton)
+        # use_triton is no longer stored as an instance attr; the deprecation
+        # shim above translated it into self.backend + self._legacy_no_triton.
         self.seed = int(0 if seed is None else seed)
         self.chunk_size_data = _positive_int(chunk_size_data, "chunk_size_data")
         self.chunk_size_centroids = _positive_int(chunk_size_centroids, "chunk_size_centroids")
@@ -217,10 +247,24 @@ class GMMXX:
         self.large_n_streaming_enabled_: Optional[bool] = None
         self.copy_stream_prefetch_enabled_: Optional[bool] = None
         self.last_fallback_reason_: Optional[str] = None
+        self.last_backend_used_: Optional[str] = None
+        self.cuda_estep_enabled_: Optional[bool] = None
+        self.cuda_fused_update_enabled_: Optional[bool] = None
+        self.cuda_approx_topk_enabled_: Optional[bool] = None
         self._batch_size: Optional[int] = None
         self._diag_inference_cache: Optional[tuple] = None
         self._full_inference_cache: Optional[tuple] = None
         self._tied_inference_cache: Optional[tuple] = None
+
+    @property
+    def use_triton(self) -> bool:
+        """Derived compatibility property for internal code.
+
+        Returns True when the backend would allow Triton (i.e., backend is not
+        'torch' and _legacy_no_triton is False). Internal methods use this
+        property so they don't need to be rewritten.
+        """
+        return self.backend != "torch" and not self._legacy_no_triton
 
     def _apply_matmul_precision(self) -> None:
         if self.matmul_precision is not None:
@@ -261,6 +305,10 @@ class GMMXX:
         self.large_n_streaming_enabled_ = None
         self.copy_stream_prefetch_enabled_ = None
         self.last_fallback_reason_ = None
+        self.last_backend_used_ = None
+        self.cuda_estep_enabled_ = None
+        self.cuda_fused_update_enabled_ = None
+        self.cuda_approx_topk_enabled_ = None
         self._batch_size = None
         self._invalidate_inference_caches()
 
@@ -498,7 +546,6 @@ class GMMXX:
             "n_components": self.k,
             "max_iter": self.niter,
             "tol": self.tol,
-            "use_triton": self.use_triton,
             "random_state": self.seed,
             "chunk_size_data": self.chunk_size_data,
             "chunk_size_centroids": self.chunk_size_centroids,
@@ -514,6 +561,11 @@ class GMMXX:
             "matmul_precision": self.matmul_precision,
             "compute_labels_on_fit": self.compute_labels_on_fit,
             "approx_top_k": self.approx_top_k,
+            "backend": self.backend,
+            # Note: use_triton is intentionally NOT returned. It's the deprecated
+            # alias; clone()-style round-trip uses 'backend' as the canonical key.
+            # _legacy_no_triton is also intentionally not exposed — it's an
+            # implementation detail of the deprecation shim.
         }
 
     def set_params(self, **params: Any):
@@ -527,6 +579,8 @@ class GMMXX:
             "n_components",
             "max_iter",
             "random_state",
+            "use_triton",   # deprecated alias
+            "backend",
         }
         for raw_name, value in params.items():
             if raw_name not in valid:
@@ -542,7 +596,24 @@ class GMMXX:
                     raise ValueError(f"{name} must be non-negative")
             elif name == "seed":
                 value = int(value)
-            elif name in {"use_triton", "verbose", "compute_labels_on_fit"}:
+            elif name == "use_triton":
+                # Deprecated; route through the same shim as __init__.
+                if value is not None:
+                    import warnings as _warnings
+                    _warnings.warn(
+                        "use_triton is deprecated; use backend= instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                    self.backend = "auto"
+                    self._legacy_no_triton = (bool(value) is False)
+                continue  # don't fall through to setattr
+            elif name == "backend":
+                if value not in _VALID_BACKENDS:
+                    raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {value!r}")
+                self.backend = value
+                continue  # don't fall through to setattr
+            elif name in {"verbose", "compute_labels_on_fit"}:
                 value = bool(value)
             elif name == "covariance_type":
                 value = _normalize_covariance_type(value)
