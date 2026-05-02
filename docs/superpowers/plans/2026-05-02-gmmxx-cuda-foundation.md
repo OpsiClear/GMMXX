@@ -256,7 +256,7 @@ def _gencode_flags() -> list[str]:
         return []  # let torch.utils.cpp_extension parse the env var
     archs = ["80", "86", "89", "90"]
     blackwell_archs = ["100", "120"]
-    if os.environ.get("GMMXX_BUILD_BLACKWELL", "1") not in {"0", "false", "no"}:
+    if os.environ.get("GMMXX_BUILD_BLACKWELL", "1").lower() in {"1", "true", "yes"}:
         nvcc_version = _detect_nvcc_version()
         if nvcc_version is not None and nvcc_version >= (12, 8):
             archs.extend(blackwell_archs)
