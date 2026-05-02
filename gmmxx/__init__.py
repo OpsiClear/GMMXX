@@ -1,4 +1,7 @@
 from .interface import GMMXX
+# Internal CUDA backend state. Always import safely — _cuda handles the
+# missing-extension case via _HAS_CUDA = False.
+from . import _cuda as _cuda  # noqa: F401
 from .large_n import (
     batch_gmm_largeN_cpu,
     large_n_predict_cpu,
