@@ -143,3 +143,14 @@ class TestGetParamsClone:
         assert m.backend == "auto"
         assert m._legacy_no_triton is True
         assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    def test_set_params_use_triton_after_explicit_backend_raises(self):
+        """Symmetry with __init__: if backend is already explicit (not 'auto'),
+        set_params(use_triton=...) must raise instead of silently overwriting."""
+        from gmmxx import GMMXX
+        m = GMMXX(**_make_kwargs(backend="cuda"))
+        with pytest.raises(ValueError, match="backend is already explicit"):
+            m.set_params(use_triton=True)
+        # State unchanged.
+        assert m.backend == "cuda"
+        assert m._legacy_no_triton is False

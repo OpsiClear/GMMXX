@@ -599,14 +599,22 @@ class GMMXX:
             elif name == "use_triton":
                 # Deprecated; route through the same shim as __init__.
                 if value is not None:
+                    if self.backend != "auto":
+                        raise ValueError(
+                            "Cannot set use_triton when backend is already explicit "
+                            f"(self.backend={self.backend!r}). Drop use_triton; "
+                            "backend= is the canonical kwarg."
+                        )
                     import warnings as _warnings
                     _warnings.warn(
-                        "use_triton is deprecated; use backend= instead.",
+                        "use_triton is deprecated; use backend='auto'|'cuda'|'triton'|'torch' instead. "
+                        "use_triton=True maps to backend='auto'; use_triton=False maps to backend='auto' "
+                        "with Triton filtered from the dispatch chain.",
                         DeprecationWarning,
                         stacklevel=2,
                     )
                     self.backend = "auto"
-                    self._legacy_no_triton = (bool(value) is False)
+                    self._legacy_no_triton = not bool(value)
                 continue  # don't fall through to setattr
             elif name == "backend":
                 if value not in _VALID_BACKENDS:
