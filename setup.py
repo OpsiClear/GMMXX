@@ -74,7 +74,7 @@ def _common_nvcc_flags() -> list[str]:
         #   the substitution mangles e.g. `bool small` -> `bool char`.
         #   Passing -Usmall via -Xcompiler undefines it at the MSVC level so it
         #   never reaches ATen headers, regardless of include order.
-        flags += ["-Xcompiler=/Zc:preprocessor"]
+        flags += ["-Xcompiler=/Zc:preprocessor,/DNOMINMAX,/Usmall"]
     else:
         flags.append("-Xcompiler=-fPIC")
     return flags
