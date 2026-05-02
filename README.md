@@ -60,6 +60,63 @@ python -m pip wheel . --no-deps -w dist
 
 The wheel contains the canonical `gmmxx` package. `third_party/` is reference code and is excluded from distributions.
 
+### CUDA backend (experimental)
+
+`GMMXX` is migrating to a hand-written CUDA backend (Phase 1 in progress; see `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md`). The CUDA path is selected automatically on hosts with a working build:
+
+| Backend | Selected when |
+| --- | --- |
+| `cuda` | `gmmxx._C` is built AND compute capability ≥ 8.0 AND shape is supported |
+| `triton` | CUDA path unsupported; Triton is installed; shape is in the Triton policy |
+| `torch` | All else (always works as a fallback) |
+
+Build prerequisites:
+
+- CUDA Toolkit ≥ 12.8 (required for sm_100/sm_120 — older toolkits work but Blackwell archs are skipped automatically).
+- C++17 compiler (MSVC 2019 16.5+ on Windows; gcc/clang on Linux).
+- `nanobind>=2.0` (installed automatically via build deps).
+
+```powershell
+# Standard install (builds CUDA extension at install time):
+uv pip install -e .
+
+# Single-arch dev build (much faster):
+$env:TORCH_CUDA_ARCH_LIST = "8.9"   # PowerShell — replace with your local arch
+uv pip install -e .
+
+# Skip the CUDA build entirely (Triton-only / CPU-only install):
+$env:GMMXX_SKIP_CUDA = "1"
+uv pip install -e ".[triton]"
+```
+
+Backend selection:
+
+```python
+from gmmxx import GMMXX
+
+# Auto: pick CUDA when supported, else Triton, else PyTorch.
+gmm = GMMXX(n_components=64, backend="auto")
+
+# Pin to a specific backend:
+gmm = GMMXX(n_components=64, backend="triton")
+
+# Or via env var (kwarg wins when explicit):
+import os
+os.environ["GMMXX_BACKEND"] = "torch"
+gmm = GMMXX(n_components=64)  # uses torch
+```
+
+After a `fit()`, inspect what actually ran:
+
+```python
+gmm.fit(x)
+print(gmm.last_backend_used_)        # "cuda" / "triton" / "torch"
+print(gmm.last_fallback_reason_)     # diagnostic string if a fallback fired
+print(gmm.fit_info_["backend_breakdown"])  # mixed runs: {"cuda": 18, "triton": 2}
+```
+
+Deprecation note: `use_triton=True/False` constructor kwarg still works but emits a `DeprecationWarning`. Switch to `backend=`. The mapping is `use_triton=True → backend="auto"`; `use_triton=False → backend="auto"` with Triton filtered from the dispatch chain (so you still get CUDA when available — historically `use_triton=False` meant "no Triton JIT", not "no GPU"). Removed in v2.0.
+
 ## Quick Start
 
 ```python
