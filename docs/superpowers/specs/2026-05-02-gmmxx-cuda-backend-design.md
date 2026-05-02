@@ -361,7 +361,7 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = [
-  "triton>=3.6,<3.7; platform_system != 'Windows'",
+  "triton>=3.6,<3.7; platform_system == 'Linux'",
   "triton-windows>=3.6,<3.7; platform_system == 'Windows'",
 ]
 sklearn = ["numpy", "scikit-learn"]
