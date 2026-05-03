@@ -1023,6 +1023,32 @@ class GMMXX:
             )
             return labels_b.squeeze(0) if batch_size is None else labels_b
         if self.covariance_type == "diag":
+            # CUDA branch (Plan 6 Task 8)
+            from . import _dispatch as _dispatch_mod
+            _shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            _resolved = _dispatch_mod.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="diag",
+                shape=_shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if _resolved == "cuda":
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                ids_b = _dispatch_mod.dispatch_kernel(
+                    "diag_assign", "cuda",
+                    x_b_compute, means_b, self.variances_b, log_w,
+                )
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(ids_b.to(torch.long))
+            self.last_backend_used_ = _resolved
+
             if self._use_triton_diag_inference(x_b):
                 try:
                     precision, weighted_means, mean_precision_mean, logdet, log_weights = self._diag_inference_terms()
@@ -1163,6 +1189,36 @@ class GMMXX:
             )
             return probs_b.squeeze(0) if batch_size is None else probs_b
         if self.covariance_type == "diag":
+            # CUDA branch (Plan 6 Task 8)
+            from . import _dispatch as _dispatch_mod
+            _shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            _resolved = _dispatch_mod.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="diag",
+                shape=_shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if _resolved == "cuda":
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_norm_b = _dispatch_mod.dispatch_kernel(
+                    "diag_logsumexp", "cuda",
+                    x_b_compute, means_b, self.variances_b, log_w,
+                )
+                probs_b = _dispatch_mod.dispatch_kernel(
+                    "diag_resp", "cuda",
+                    x_b_compute, means_b, self.variances_b, log_w, log_norm_b,
+                )
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(probs_b)
+            self.last_backend_used_ = _resolved
+
             if self._use_triton_diag_inference(x_b):
                 try:
                     precision, weighted_means, mean_precision_mean, logdet, log_weights = self._diag_inference_terms()
@@ -1374,6 +1430,32 @@ class GMMXX:
             )
             return scores_b.squeeze(0) if batch_size is None else scores_b
         if self.covariance_type == "diag":
+            # CUDA branch (Plan 6 Task 8)
+            from . import _dispatch as _dispatch_mod
+            _shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            _resolved = _dispatch_mod.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="diag",
+                shape=_shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if _resolved == "cuda":
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                ll_b = _dispatch_mod.dispatch_kernel(
+                    "diag_logsumexp", "cuda",
+                    x_b_compute, means_b, self.variances_b, log_w,
+                )
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(ll_b)
+            self.last_backend_used_ = _resolved
+
             if self._use_triton_diag_inference(x_b):
                 try:
                     precision, weighted_means, mean_precision_mean, logdet, log_weights = self._diag_inference_terms()

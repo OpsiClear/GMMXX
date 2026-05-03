@@ -151,11 +151,15 @@ def resolve_backend_with_env(
 
 
 _TRITON_OPS_BY_NAME: dict[str, str] = {
-    # spherical
+    # spherical (Plan 3)
     "spherical_assign":    "gmmxx.assign_spherical_triton.spherical_assign_triton",
     "spherical_logsumexp": "gmmxx.assign_spherical_triton.spherical_logsumexp_triton",
     "spherical_resp":      "gmmxx.assign_spherical_triton.spherical_resp_triton",
-    # diag, tied, full — wired in Plans 6-8 as those backends gain ops.
+    # diag (Plan 6)
+    "diag_assign":    "gmmxx.assign_diag_triton.diag_assign_triton",
+    "diag_logsumexp": "gmmxx.assign_diag_triton.diag_logsumexp_triton",
+    "diag_resp":      "gmmxx.assign_diag_triton.diag_resp_triton",
+    # tied, full — wired in Plans 7-8 as those backends gain ops.
 }
 
 
