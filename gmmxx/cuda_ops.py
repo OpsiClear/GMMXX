@@ -16,6 +16,7 @@ spherical_assign = _cuda.spherical_assign
 spherical_logsumexp = _cuda.spherical_logsumexp
 spherical_resp = _cuda.spherical_resp
 blocked_update_spherical = _cuda.blocked_update_spherical
+blocked_update_spherical_sorted = _cuda.blocked_update_spherical_sorted
 finalize_spherical = _cuda.finalize_spherical
 
 # Lifecycle / introspection helpers.
@@ -31,6 +32,7 @@ __all__ = [
     "spherical_logsumexp",
     "spherical_resp",
     "blocked_update_spherical",
+    "blocked_update_spherical_sorted",
     "finalize_spherical",
     "has_cuda",
     "require_cuda",

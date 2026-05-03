@@ -30,6 +30,8 @@ except ImportError as exc:
     _HAS_CUDA = False
     _IMPORT_ERROR = exc
 
+_SORT_THRESHOLD_NK = 2 ** 21  # ~2M; below this, sort cost dominates
+
 
 class CudaBackendUnavailable(RuntimeError):
     """Raised when gmmxx._C was not built (e.g. GMMXX_SKIP_CUDA=1)."""
@@ -163,9 +165,12 @@ def blocked_update_spherical(
     x: torch.Tensor,
     cluster_ids: torch.Tensor,
     n_components: int,
+    *,
+    force_sort: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """M-step accumulator. Allocates and zero-initializes sums/sumsq/counts,
-    calls the kernel, returns the three accumulator tensors.
+    """M-step accumulator. Picks sorted-run vs per-token by N*K heuristic.
+
+    force_sort: True forces sorted path; False forces per-token; None auto.
 
     Returns (sums, sumsq, counts) where:
       sums: (B, K, D) fp32
@@ -180,12 +185,52 @@ def blocked_update_spherical(
     sums = torch.zeros((B, K, D), dtype=torch.float32, device=x.device)
     sumsq = torch.zeros((B, K), dtype=torch.float32, device=x.device)
     counts = torch.zeros((B, K), dtype=torch.int32, device=x.device)
+
+    use_sort = force_sort if force_sort is not None else (N * K >= _SORT_THRESHOLD_NK)
+
     try:
-        _C.blocked_update_spherical(x, cluster_ids, sums, sumsq, counts)
+        if use_sort:
+            sorted_ids, perm = cluster_ids.sort(dim=1)
+            x_sorted = torch.gather(x, 1, perm.unsqueeze(-1).expand(-1, -1, D))
+            _C.blocked_update_spherical_sorted(
+                x_sorted.contiguous(), sorted_ids.int().contiguous(),
+                sums, sumsq, counts,
+            )
+        else:
+            _C.blocked_update_spherical(x, cluster_ids, sums, sumsq, counts)
     except RuntimeError as exc:
         if _no_fallback():
             raise
-        raise CudaRuntimeFallback(f"blocked_update_spherical failed: {exc}") from exc
+        raise CudaRuntimeFallback(
+            f"blocked_update_spherical (use_sort={use_sort}) failed: {exc}"
+        ) from exc
+    return sums, sumsq, counts
+
+
+def blocked_update_spherical_sorted(
+    x_sorted: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    n_components: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Direct sorted-run wrapper. Caller is responsible for sorting cluster_ids
+    and gathering x to match. For most uses, prefer blocked_update_spherical
+    which handles the sort + heuristic."""
+    require_cuda()
+    x_sorted = _check_input(x_sorted, "x_sorted")
+    sorted_ids = _check_input(sorted_ids, "sorted_ids", dtype=torch.int32)
+    B, N, D = x_sorted.shape
+    K = int(n_components)
+    sums = torch.zeros((B, K, D), dtype=torch.float32, device=x_sorted.device)
+    sumsq = torch.zeros((B, K), dtype=torch.float32, device=x_sorted.device)
+    counts = torch.zeros((B, K), dtype=torch.int32, device=x_sorted.device)
+    try:
+        _C.blocked_update_spherical_sorted(x_sorted, sorted_ids, sums, sumsq, counts)
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(
+            f"blocked_update_spherical_sorted failed: {exc}"
+        ) from exc
     return sums, sumsq, counts
 
 
