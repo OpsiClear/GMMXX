@@ -65,3 +65,23 @@ def cuda_full_supported(d: int, n_components: int, dtype) -> bool:
     """
     del d, n_components, dtype
     return False
+
+
+def cuda_spherical_fused_supported(d: int, n_components: int, dtype) -> bool:
+    """True iff the fused single-tile spherical E/M kernel can handle this shape+dtype.
+
+    Plan 5 (safe + sm80): supports d in (0, 64], n_components in (0, 128] for
+    dtype in {fp32, fp16, bf16}. Outside this window, the unfused
+    (assign + blocked_update + finalize) pipeline runs (correct but slower
+    for medium shapes).
+    """
+    import torch as _torch
+    if dtype is None:
+        return False
+    if dtype not in (_torch.float32, _torch.float16, _torch.bfloat16):
+        return False
+    if not (0 < d <= 64):
+        return False
+    if not (0 < n_components <= 128):
+        return False
+    return True
