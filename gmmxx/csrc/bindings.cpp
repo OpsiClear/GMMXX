@@ -7,6 +7,7 @@
 #include "canary/canary.h"
 #include "estep/spherical.h"
 #include "mstep/spherical.h"
+#include "fused/spherical.h"
 
 namespace nb = nanobind;
 
@@ -84,5 +85,16 @@ NB_MODULE(_C, m) {
         nb::arg("reg_covar"),
         "Finalize spherical M-step. Returns (means, var, weights). "
         "Empty clusters preserve previous (means, var) and get weight 0.");
+
+    m.def(
+        "spherical_fused",
+        &gmmxx::fused::spherical::fused,
+        nb::arg("x"),
+        nb::arg("means"),
+        nb::arg("var"),
+        nb::arg("log_w"),
+        nb::arg("reg_covar"),
+        "Fused spherical E/M single-tile kernel. Returns (means, var, weights, "
+        "lse_per_sample, labels). Requires D <= 64, K <= 128.");
 
 }
