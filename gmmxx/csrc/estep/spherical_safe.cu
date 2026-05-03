@@ -172,6 +172,7 @@ void launch_assign(const at::Tensor& x, const at::Tensor& means,
     int N = (int)x.size(1);
     int D = (int)x.size(2);
     int K = (int)means.size(1);
+    if (N == 0) return;  // empty input — output already has correct shape (B,0)
     constexpr int kThreads = 128;
     dim3 grid((N + kThreads - 1) / kThreads, B);
     spherical_assign_safe_kernel<T><<<grid, kThreads, 0, stream>>>(
@@ -191,6 +192,7 @@ void launch_logsumexp(const at::Tensor& x, const at::Tensor& means,
     int N = (int)x.size(1);
     int D = (int)x.size(2);
     int K = (int)means.size(1);
+    if (N == 0) return;  // empty input
     int threads = ((K + ::gmmxx::kWarp - 1) / ::gmmxx::kWarp) * ::gmmxx::kWarp;
     threads = std::min(threads, 1024);
     int n_warps = (threads + ::gmmxx::kWarp - 1) / ::gmmxx::kWarp;
@@ -213,6 +215,7 @@ void launch_resp(const at::Tensor& x, const at::Tensor& means,
     int N = (int)x.size(1);
     int D = (int)x.size(2);
     int K = (int)means.size(1);
+    if (N == 0) return;  // empty input
     constexpr int kThreads = 64;
     dim3 grid(N, B, (K + kThreads - 1) / kThreads);
     spherical_resp_safe_kernel<T><<<grid, kThreads, 0, stream>>>(
