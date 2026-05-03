@@ -113,12 +113,14 @@ def _build_extension():
     sources = [
         str(CSRC / "bindings.cpp"),
         str(CSRC / "canary" / "canary.cu"),
+        str(CSRC / "estep" / "spherical_safe.cu"),
         str(nb_combined),
     ]
     include_dirs = [
         str(CSRC),
         str(CSRC / "common"),
         str(CSRC / "canary"),
+        str(CSRC / "estep"),
         nb_include,
         str(nb_robin_include),
     ]
