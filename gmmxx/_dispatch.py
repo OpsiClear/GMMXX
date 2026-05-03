@@ -142,3 +142,59 @@ def resolve_backend_with_env(
         if env in _VALID_BACKENDS:
             effective = env
     return resolve_backend(effective, covariance, shape, dtype, legacy_no_triton=legacy_no_triton)
+
+
+# ---------------------------------------------------------------------------
+# Kernel dispatch helper. Plan 3 onwards: inference paths consult
+# resolve_backend, then call dispatch_kernel(op_name, resolved, *args).
+# ---------------------------------------------------------------------------
+
+
+_TRITON_OPS_BY_NAME: dict[str, str] = {
+    # spherical
+    "spherical_assign":    "gmmxx.assign_spherical_triton.spherical_assign_triton",
+    "spherical_logsumexp": "gmmxx.assign_spherical_triton.spherical_logsumexp_triton",
+    "spherical_resp":      "gmmxx.assign_spherical_triton.spherical_resp_triton",
+    # diag, tied, full — wired in Plans 6-8 as those backends gain ops.
+}
+
+
+def _resolve_callable(op_name: str, backend: str):
+    """Look up the callable for (op_name, backend). Raises if not found."""
+    if backend == "cuda":
+        from . import _cuda
+        return getattr(_cuda, op_name)
+    if backend == "triton":
+        path = _TRITON_OPS_BY_NAME.get(op_name)
+        if path is None:
+            raise KeyError(f"no triton op named {op_name!r}")
+        module_path, attr = path.rsplit(".", 1)
+        import importlib
+        return getattr(importlib.import_module(module_path), attr)
+    if backend == "torch":
+        # Each torch op is a slim wrapper inside torch_fallback. Plan 3 does
+        # not require this branch for the spherical inference paths because
+        # interface.py calls torch_fallback functions directly when backend
+        # resolves to torch — but the symmetric path is wired here for
+        # symmetry and Plan 6+ readiness.
+        from . import torch_fallback
+        return getattr(torch_fallback, op_name)
+    raise ValueError(f"unknown backend {backend!r}")
+
+
+def dispatch_kernel(op_name: str, backend: str, *args, **kw):
+    """Resolve the callable for (op_name, backend) and call it.
+
+    Wraps RuntimeError in CudaRuntimeFallback when backend == "cuda" so callers
+    can catch a single exception type and re-resolve.
+    """
+    fn = _resolve_callable(op_name, backend)
+    if backend == "cuda":
+        from ._cuda import _no_fallback, CudaRuntimeFallback
+        try:
+            return fn(*args, **kw)
+        except RuntimeError as exc:
+            if _no_fallback():
+                raise
+            raise CudaRuntimeFallback(f"{op_name} (cuda) failed: {exc}") from exc
+    return fn(*args, **kw)

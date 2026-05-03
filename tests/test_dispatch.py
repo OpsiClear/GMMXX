@@ -155,3 +155,40 @@ class TestEnvVarOverride:
             # Plan 1: cuda stub False, triton supported → triton
             # (or torch if triton not installed). Just assert it's a valid value.
             assert result in {"cuda", "triton", "torch"}
+
+
+class TestDispatchKernel:
+    def test_cuda_op_resolves_to_cuda_module(self):
+        if not _dispatch._cuda.has_cuda():
+            pytest.skip("requires CUDA")
+        import torch
+        x = torch.randn(1, 8, 4, device="cuda")
+        means = torch.randn(1, 3, 4, device="cuda")
+        var = torch.ones(1, 3, device="cuda")
+        log_w = torch.zeros(1, 3, device="cuda")
+        out = _dispatch.dispatch_kernel(
+            "spherical_assign", "cuda", x, means, var, log_w
+        )
+        assert out.shape == (1, 8) and out.dtype == torch.int32
+
+    def test_triton_op_path_resolves(self):
+        """Verify the _TRITON_OPS_BY_NAME map looks up the right callable."""
+        try:
+            fn = _dispatch._resolve_callable("spherical_assign", "triton")
+            assert callable(fn)
+        except (ImportError, KeyError):
+            pytest.skip("Triton not installed")
+
+    def test_unknown_op_in_cuda_raises_attribute_error(self):
+        if not _dispatch._cuda.has_cuda():
+            pytest.skip("requires CUDA")
+        with pytest.raises(AttributeError):
+            _dispatch._resolve_callable("nonexistent_op", "cuda")
+
+    def test_unknown_op_in_triton_raises_key_error(self):
+        with pytest.raises(KeyError):
+            _dispatch._resolve_callable("nonexistent_op", "triton")
+
+    def test_unknown_backend_raises(self):
+        with pytest.raises(ValueError, match="unknown backend"):
+            _dispatch._resolve_callable("spherical_assign", "bogus")
