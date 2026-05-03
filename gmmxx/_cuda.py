@@ -563,3 +563,182 @@ def tied_finalize(
 
     chol_new = torch.linalg.cholesky(sigma)  # (B, D, D)
     return means_new, chol_new, weights_new
+
+
+# ---------------------------------------------------------------------------
+# Full kernels (Plan 8 — pure-torch orchestration for D <= 16, K <= 32)
+# ---------------------------------------------------------------------------
+
+
+def _full_logits(
+    x: torch.Tensor, means: torch.Tensor, L: torch.Tensor, log_w: torch.Tensor
+) -> torch.Tensor:
+    """Compute (B, N, K) logits via batched solve_triangular.
+
+    x: (B, N, D); means: (B, K, D); L: (B, K, D, D); log_w: (B, K).
+    Returns fp32 logits.
+    """
+    import math
+    B, N, D = x.shape
+    K = means.shape[1]
+    x_f = x.float()
+    means_f = means.float()
+    L_f = L.float()
+    diff = x_f.unsqueeze(2) - means_f.unsqueeze(1)  # (B, N, K, D)
+    diff_t = diff.permute(0, 2, 3, 1).contiguous()   # (B, K, D, N)
+    z = torch.linalg.solve_triangular(L_f, diff_t, upper=False)  # (B, K, D, N)
+    dist_sq = z.pow(2).sum(2).permute(0, 2, 1)       # (B, N, K)
+    log_det_L = L_f.diagonal(dim1=-2, dim2=-1).abs().log().sum(-1)  # (B, K)
+    log_norm_const = 0.5 * D * math.log(2 * math.pi)
+    return (
+        log_w.float().unsqueeze(1)
+        - log_norm_const
+        - log_det_L.unsqueeze(1)
+        - 0.5 * dist_sq
+    )
+
+
+def full_assign(
+    x: torch.Tensor, means: torch.Tensor, L: torch.Tensor, log_w: torch.Tensor
+) -> torch.Tensor:
+    """Full covariance E-step assign. Returns int32 (B, N)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    L = _check_input(L, "L")
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    logits = _full_logits(x, means, L, log_w)
+    return logits.argmax(-1).to(torch.int32)
+
+
+def full_logsumexp(
+    x: torch.Tensor, means: torch.Tensor, L: torch.Tensor, log_w: torch.Tensor
+) -> torch.Tensor:
+    """Full covariance E-step logsumexp. Returns fp32 (B, N)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    L = _check_input(L, "L")
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    return _full_logits(x, means, L, log_w).logsumexp(-1)
+
+
+def full_resp(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    L: torch.Tensor,
+    log_w: torch.Tensor,
+    log_norm: torch.Tensor,
+) -> torch.Tensor:
+    """Full covariance E-step responsibilities. Returns fp32 (B, N, K)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    L = _check_input(L, "L")
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    log_norm = _check_input(log_norm, "log_norm", dtype=torch.float32)
+    logits = _full_logits(x, means, L, log_w)
+    return (logits - log_norm.unsqueeze(-1)).exp()
+
+
+def full_blocked_update(
+    x: torch.Tensor, cluster_ids: torch.Tensor, n_components: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Full covariance hard-assign M-step accumulator.
+
+    Returns (sums (B,K,D), outer_sums (B,K,D,D), counts (B,K) int32).
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    cluster_ids = _check_input(cluster_ids, "cluster_ids", dtype=torch.int32)
+    B, N, D = x.shape
+    K = int(n_components)
+    device = x.device
+    x_f = x.float()
+    ids_long = cluster_ids.long()
+
+    sums = torch.zeros(B, K, D, dtype=torch.float32, device=device)
+    sums.scatter_add_(
+        dim=1,
+        index=ids_long.unsqueeze(-1).expand(-1, -1, D),
+        src=x_f,
+    )
+
+    xx_per_point = x_f.unsqueeze(-1) * x_f.unsqueeze(-2)  # (B, N, D, D)
+    outer_sums = torch.zeros(B, K, D, D, dtype=torch.float32, device=device)
+    outer_sums.scatter_add_(
+        dim=1,
+        index=ids_long.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, D, D),
+        src=xx_per_point,
+    )
+
+    ones_int32 = torch.ones_like(cluster_ids, dtype=torch.int32)
+    counts = torch.zeros(B, K, dtype=torch.int32, device=device)
+    counts.scatter_add_(dim=1, index=ids_long, src=ones_int32)
+
+    return sums, outer_sums, counts
+
+
+def full_finalize(
+    sums: torch.Tensor,
+    outer_sums: torch.Tensor,
+    counts: torch.Tensor,
+    old_means: torch.Tensor,
+    old_L: torch.Tensor,
+    total_n: int,
+    reg_covar: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Full M-step finalize.
+
+    Returns (means_new (B,K,D), L_new (B,K,D,D), weights_new (B,K)).
+
+    For empty clusters or non-PD Σ, preserves old_means and old_L.
+    """
+    require_cuda()
+    sums = _check_input(sums, "sums", dtype=torch.float32)
+    outer_sums = _check_input(outer_sums, "outer_sums", dtype=torch.float32)
+    counts = _check_input(counts, "counts")
+    old_means = _check_input(old_means, "old_means")
+    old_L = _check_input(old_L, "old_L")
+
+    B, K, D = sums.shape
+    device = sums.device
+    counts_f = counts.float()
+    n_k = counts_f.clamp_min(1e-30)
+
+    means_new = sums / n_k.unsqueeze(-1)  # (B, K, D)
+    weights_new = counts_f / float(total_n)
+
+    sigma = outer_sums / n_k.unsqueeze(-1).unsqueeze(-1) - (
+        means_new.unsqueeze(-1) * means_new.unsqueeze(-2)
+    )
+    eye = torch.eye(D, device=device, dtype=sigma.dtype).view(1, 1, D, D)
+    sigma = sigma + reg_covar * eye
+    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+
+    L_new, info = torch.linalg.cholesky_ex(sigma)
+
+    counts_int = counts.to(torch.int32) if counts.dtype != torch.int32 else counts
+    failed = (info != 0) | (counts_int <= 0)  # (B, K) bool
+    if failed.any():
+        # Cast old_means / old_L to fp32 for arithmetic, then back at the end.
+        old_means_f = old_means.float()
+        old_L_f = old_L.float()
+        means_new = torch.where(
+            failed.unsqueeze(-1).expand_as(means_new),
+            old_means_f,
+            means_new,
+        )
+        L_new = torch.where(
+            failed.unsqueeze(-1).unsqueeze(-1).expand_as(L_new),
+            old_L_f,
+            L_new,
+        )
+        weights_new = torch.where(failed, torch.zeros_like(weights_new), weights_new)
+
+    if old_means.dtype != torch.float32:
+        means_new = means_new.to(old_means.dtype)
+    if old_L.dtype != torch.float32:
+        L_new = L_new.to(old_L.dtype)
+
+    return means_new, L_new, weights_new
