@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <c10/core/ScalarType.h>
 
 namespace gmmxx {
 
@@ -33,7 +34,7 @@ struct dtype_traits;
 template <>
 struct dtype_traits<__half> {
   using packed2 = __half2;
-  static constexpr int torch_scalar_type = 5;  // torch::kHalf
+  static constexpr c10::ScalarType torch_scalar_type = c10::ScalarType::Half;
   static constexpr const char* name = "fp16";
   static constexpr bool is_half = true;
 };
@@ -41,7 +42,7 @@ struct dtype_traits<__half> {
 template <>
 struct dtype_traits<__nv_bfloat16> {
   using packed2 = __nv_bfloat162;
-  static constexpr int torch_scalar_type = 15; // torch::kBFloat16
+  static constexpr c10::ScalarType torch_scalar_type = c10::ScalarType::BFloat16;
   static constexpr const char* name = "bf16";
   static constexpr bool is_half = true;
 };
@@ -49,7 +50,7 @@ struct dtype_traits<__nv_bfloat16> {
 template <>
 struct dtype_traits<float> {
   using packed2 = float2;
-  static constexpr int torch_scalar_type = 6;  // torch::kFloat
+  static constexpr c10::ScalarType torch_scalar_type = c10::ScalarType::Float;
   static constexpr const char* name = "fp32";
   static constexpr bool is_half = false;
 };
