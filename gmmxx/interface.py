@@ -258,13 +258,17 @@ class GMMXX:
 
     @property
     def use_triton(self) -> bool:
-        """Derived compatibility property for internal code.
+        """Derived: True iff the Triton path may be used at all from this estimator.
 
-        Returns True when the backend would allow Triton (i.e., backend is not
-        'torch' and _legacy_no_triton is False). Internal methods use this
-        property so they don't need to be rewritten.
+        Returns True only when the user requested 'auto' or 'triton' (and didn't
+        use the legacy use_triton=False shim). Explicit backend='cuda' returns
+        False so internal Triton-gated inference paths fall to torch (not triton)
+        when the user explicitly picked CUDA. Plan 3 rewires those inference paths
+        to consult the dispatcher directly.
         """
-        return self.backend != "torch" and not self._legacy_no_triton
+        if self._legacy_no_triton:
+            return False
+        return self.backend in {"auto", "triton"}
 
     def _apply_matmul_precision(self) -> None:
         if self.matmul_precision is not None:

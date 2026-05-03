@@ -154,3 +154,38 @@ class TestGetParamsClone:
         # State unchanged.
         assert m.backend == "cuda"
         assert m._legacy_no_triton is False
+
+
+class TestUseTritonProperty:
+    def test_property_false_under_explicit_cuda(self):
+        """Plan 1 final-review I-1 lite: explicit backend='cuda' means
+        no-Triton-fallback. The use_triton property reflects this."""
+        from gmmxx import GMMXX
+        m = GMMXX(n_components=4, backend="cuda")
+        assert m.use_triton is False
+        # Triton-gated inference paths (predict, score_samples, etc.)
+        # consult this property; under backend='cuda' they will fall to
+        # torch instead of triton until Plan 3 rewires them.
+
+    def test_property_true_under_auto(self):
+        from gmmxx import GMMXX
+        m = GMMXX(n_components=4, backend="auto")
+        assert m.use_triton is True
+
+    def test_property_true_under_explicit_triton(self):
+        from gmmxx import GMMXX
+        m = GMMXX(n_components=4, backend="triton")
+        assert m.use_triton is True
+
+    def test_property_false_under_explicit_torch(self):
+        from gmmxx import GMMXX
+        m = GMMXX(n_components=4, backend="torch")
+        assert m.use_triton is False
+
+    def test_property_false_under_legacy_no_triton(self):
+        import warnings
+        from gmmxx import GMMXX
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            m = GMMXX(n_components=4, use_triton=False)
+        assert m.use_triton is False
