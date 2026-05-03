@@ -62,7 +62,7 @@ The wheel contains the canonical `gmmxx` package. `third_party/` is reference co
 
 ### CUDA backend (experimental)
 
-`GMMXX` is migrating to a hand-written CUDA backend. **Spherical covariance now runs on the CUDA path** (Plan 2 — safe SIMT kernels for fp32/fp16/bf16, `0 < D ≤ 128`, `0 < K ≤ 2048`). Diagonal, tied, and full are still on Triton/PyTorch — coming in Plans 6–8. See `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md` for the overall design and `docs/superpowers/plans/` for per-PR plans.
+`GMMXX` is migrating to a hand-written CUDA backend. **Spherical covariance is fully on the CUDA path** for both training and inference (Plan 3). The sm_80 `mma.sync` optimized E-step `assign` runs for fp16/bf16 inputs on Ampere+ when `D % 16 == 0`; fp32 stays on the safe SIMT path. `predict()`, `predict_proba()`, `score_samples()`, and `score()` all dispatch to CUDA when `backend="cuda"` and the shape is in the support window (`0 < D ≤ 128`, `0 < K ≤ 2048`). Diagonal, tied, and full are still on Triton/PyTorch — coming in Plans 6–8. See `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md` for the overall design and `docs/superpowers/plans/` for per-PR plans.
 
 The CUDA path is selected automatically on hosts with a working build:
 
