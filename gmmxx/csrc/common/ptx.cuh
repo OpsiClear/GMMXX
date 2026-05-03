@@ -1,22 +1,41 @@
 #pragma once
 
-// PTX wrappers shared across kernels.
+// Warp-level PTX wrappers shared across kernels.
 //
-// This file is a SKELETON for Plan 1. Plan 2 (spherical) will populate:
-//   - cp_async_cg, cp_async_commit, cp_async_wait_group<N>, cp_async_wait_all
-//   - ldmatrix_sync_x4, ldmatrix_sync_x4_trans
-//   - mma_m16n8k16_f32_f16, mma_m16n8k16_f32_bf16
-//   - mma_m16n8k8_f32_tf32 (Phase 2 hook)
-//   - atomic_add_block, atomic_add_system
-//   - warp_shfl_xor_sync, warp_reduce_add_sync
-//
-// Each wrapper is `__device__ __forceinline__` and gated on GMMXX_HAS_*
-// macros from arch.cuh.
+// Plan 2 populates only what the spherical safe path needs: warp shuffle
+// reductions in fp32. Plan 3 will add cp_async_*, ldmatrix_sync_x4,
+// mma_m16n8k16_*. All wrappers are __device__ __forceinline__ and gated
+// on GMMXX_HAS_* macros from arch.cuh.
 
 #include "arch.cuh"
+#include <cuda_runtime.h>
 
 namespace gmmxx { namespace ptx {
 
-// Skeleton — see Plan 2 for population.
+// Full-warp xor shuffle. Available on all CUDA-capable arches via
+// __shfl_xor_sync; we wrap it for symmetry with the named-helper style
+// used by the kernels.
+__device__ __forceinline__ float warp_shfl_xor_f32(float v, int laneMask) {
+    return __shfl_xor_sync(0xffffffffu, v, laneMask, kWarp);
+}
+
+// Full-warp sum reduction. Returns the same value on every lane.
+__device__ __forceinline__ float warp_reduce_add_f32(float v) {
+    #pragma unroll
+    for (int offset = kWarp / 2; offset > 0; offset >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset, kWarp);
+    }
+    return v;
+}
+
+// Full-warp max reduction. Returns the same value on every lane.
+__device__ __forceinline__ float warp_reduce_max_f32(float v) {
+    #pragma unroll
+    for (int offset = kWarp / 2; offset > 0; offset >>= 1) {
+        float other = __shfl_xor_sync(0xffffffffu, v, offset, kWarp);
+        v = fmaxf(v, other);
+    }
+    return v;
+}
 
 }}  // namespace gmmxx::ptx
