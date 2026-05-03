@@ -27,6 +27,14 @@ diag_resp = _cuda.diag_resp
 blocked_update_diag = _cuda.blocked_update_diag
 finalize_diag = _cuda.finalize_diag
 
+# Tied (Plan 7).
+tied_project = _cuda.tied_project
+tied_log_det = _cuda.tied_log_det
+tied_assign = _cuda.tied_assign
+tied_logsumexp = _cuda.tied_logsumexp
+tied_resp = _cuda.tied_resp
+tied_finalize = _cuda.tied_finalize
+
 # Lifecycle / introspection helpers.
 has_cuda = _cuda.has_cuda
 require_cuda = _cuda.require_cuda
@@ -48,6 +56,12 @@ __all__ = [
     "diag_resp",
     "blocked_update_diag",
     "finalize_diag",
+    "tied_project",
+    "tied_log_det",
+    "tied_assign",
+    "tied_logsumexp",
+    "tied_resp",
+    "tied_finalize",
     "has_cuda",
     "require_cuda",
     "CudaBackendUnavailable",
