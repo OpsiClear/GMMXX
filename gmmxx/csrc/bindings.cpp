@@ -8,6 +8,7 @@
 #include "estep/spherical.h"
 #include "estep/diag.h"
 #include "mstep/spherical.h"
+#include "mstep/diag.h"
 #include "fused/spherical.h"
 
 namespace nb = nanobind;
@@ -97,6 +98,18 @@ NB_MODULE(_C, m) {
         nb::arg("reg_covar"),
         "Fused spherical E/M single-tile kernel. Returns (means, var, weights, "
         "lse_per_sample, labels). Requires D <= 64, K <= 128.");
+
+    m.def("blocked_update_diag", &gmmxx::mstep::diag::blocked_update,
+          nb::arg("x"), nb::arg("cluster_ids"),
+          nb::arg("sums_out"), nb::arg("sumsq_out"), nb::arg("counts_out"),
+          "Diagonal M-step accumulator. Caller MUST zero sums_out (B,K,D), "
+          "sumsq_out (B,K,D), counts_out (B,K) before calling.");
+
+    m.def("finalize_diag", &gmmxx::mstep::diag::finalize,
+          nb::arg("sums"), nb::arg("sumsq"), nb::arg("counts"),
+          nb::arg("old_means"), nb::arg("old_var"),
+          nb::arg("total_n"), nb::arg("reg_covar"),
+          "Finalize diagonal M-step. Returns (means (B,K,D), var (B,K,D), weights (B,K)).");
 
     m.def("diag_assign", &gmmxx::estep::diag::assign,
           nb::arg("x"), nb::arg("means"), nb::arg("var"), nb::arg("log_w"),
