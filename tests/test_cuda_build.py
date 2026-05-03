@@ -72,3 +72,90 @@ def test_skip_cuda_env_var_subprocess():
     assert result.stdout.strip() in {"OK", "SKIP: _C is built; cannot test missing-extension path here"}, (
         f"stdout: {result.stdout!r}"
     )
+
+
+def test_no_fallback_env_var_subprocess():
+    """When GMMXX_CUDA_NO_FALLBACK=1 is set, runtime CUDA errors propagate
+    as RuntimeError (not wrapped in CudaRuntimeFallback).
+
+    Subprocess pattern because the env-var check happens via os.environ.get
+    in _cuda._no_fallback(); we want a clean process to control the env.
+    """
+    code = (
+        "import os\n"
+        "os.environ['GMMXX_CUDA_NO_FALLBACK'] = '1'\n"
+        "import torch\n"
+        "from gmmxx import _cuda\n"
+        "if not _cuda.has_cuda():\n"
+        "    print('SKIP: no CUDA')\n"
+        "else:\n"
+        "    # Force a runtime error by passing a CPU tensor — ValueError\n"
+        "    # raised by _check_input is NOT a RuntimeError, so we need to\n"
+        "    # monkey-patch _C.canary_add_offset to raise RuntimeError instead.\n"
+        "    original = _cuda._C.canary_add_offset\n"
+        "    def boom(*args, **kw):\n"
+        "        raise RuntimeError('synthetic CUDA failure')\n"
+        "    _cuda._C.canary_add_offset = boom\n"
+        "    x = torch.arange(4, dtype=torch.int32, device='cuda')\n"
+        "    try:\n"
+        "        _cuda.canary_add_offset(x, 5)\n"
+        "        print('FAIL: should have raised')\n"
+        "    except _cuda.CudaRuntimeFallback:\n"
+        "        print('FAIL: was wrapped in CudaRuntimeFallback (no_fallback should propagate raw)')\n"
+        "    except RuntimeError as exc:\n"
+        "        if 'synthetic CUDA failure' in str(exc):\n"
+        "            print('OK')\n"
+        "        else:\n"
+        "            print(f'FAIL: unexpected error {exc}')\n"
+        "    finally:\n"
+        "        _cuda._C.canary_add_offset = original\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    line = result.stdout.strip()
+    assert line in {"OK", "SKIP: no CUDA"}, f"stdout: {result.stdout!r}"
+
+
+def test_default_fallback_wraps_runtime_error_subprocess():
+    """Without GMMXX_CUDA_NO_FALLBACK, runtime CUDA errors get wrapped in
+    CudaRuntimeFallback so the dispatcher can fall through to Triton/torch."""
+    code = (
+        "import os\n"
+        "os.environ.pop('GMMXX_CUDA_NO_FALLBACK', None)\n"
+        "import torch\n"
+        "from gmmxx import _cuda\n"
+        "if not _cuda.has_cuda():\n"
+        "    print('SKIP: no CUDA')\n"
+        "else:\n"
+        "    original = _cuda._C.canary_add_offset\n"
+        "    def boom(*args, **kw):\n"
+        "        raise RuntimeError('synthetic CUDA failure')\n"
+        "    _cuda._C.canary_add_offset = boom\n"
+        "    x = torch.arange(4, dtype=torch.int32, device='cuda')\n"
+        "    try:\n"
+        "        _cuda.canary_add_offset(x, 5)\n"
+        "        print('FAIL: should have raised')\n"
+        "    except _cuda.CudaRuntimeFallback as exc:\n"
+        "        if 'synthetic CUDA failure' in str(exc):\n"
+        "            print('OK')\n"
+        "        else:\n"
+        "            print(f'FAIL: unexpected wrapped error {exc}')\n"
+        "    except RuntimeError as exc:\n"
+        "        print(f'FAIL: unwrapped RuntimeError {exc}')\n"
+        "    finally:\n"
+        "        _cuda._C.canary_add_offset = original\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    line = result.stdout.strip()
+    assert line in {"OK", "SKIP: no CUDA"}, f"stdout: {result.stdout!r}"
