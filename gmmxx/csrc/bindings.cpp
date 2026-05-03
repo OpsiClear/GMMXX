@@ -61,4 +61,17 @@ NB_MODULE(_C, m) {
         nb::arg("counts_out"),
         "Spherical M-step accumulator (per-token atomicAdd). Caller MUST zero "
         "sums_out/sumsq_out/counts_out before calling.");
+
+    m.def(
+        "finalize_spherical",
+        &gmmxx::mstep::spherical::finalize,
+        nb::arg("sums"),
+        nb::arg("sumsq"),
+        nb::arg("counts"),
+        nb::arg("old_means"),
+        nb::arg("old_var"),
+        nb::arg("total_n"),
+        nb::arg("reg_covar"),
+        "Finalize spherical M-step. Returns (means, var, weights). "
+        "Empty clusters preserve previous (means, var) and get weight 0.");
 }

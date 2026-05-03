@@ -12,6 +12,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/tuple.h>
 
 // Windows.h (pulled in via Python.h on Windows) defines `small` as `char`,
 // which collides with PyTorch headers that use `small` as a parameter name
