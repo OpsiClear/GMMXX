@@ -68,6 +68,128 @@ except Exception:
     _HAS_TRITON = False
 
 
+def _largen_spherical_cuda(
+    x_cpu: torch.Tensor,
+    n_clusters: int,
+    *,
+    max_iters: int = 100,
+    tol: float = 1e-4,
+    dtype=None,
+    device=None,
+    chunk_size_data_cpu: int = 1048576,
+    seed: int = 0,
+    reg_covar: float = 1e-6,
+    verbose: bool = False,
+    init_centroids=None,
+    **_unused_kwargs,
+):
+    """Spherical large-N EM training on CUDA. Streams chunks of x_cpu to GPU
+    and runs per-chunk E-step + M-step partial accumulation; aggregates
+    partials at the end of each iteration; finalizes via finalize_spherical.
+
+    Returns the same tuple as the existing torch_native large_n path:
+    (cluster_ids, means, variances, weights, info_dict). Caller should
+    match the shape contract of the entry point (e.g., (B=1,N) for ids).
+    """
+    from . import _cuda as _cuda_mod
+    import math
+
+    N, D = x_cpu.shape
+    K = int(n_clusters)
+    if device is None:
+        device = torch.device("cuda:0")
+    if dtype is None:
+        dtype = torch.float32
+
+    # Initialize means by sampling K random points from the input.
+    rng = torch.Generator().manual_seed(int(seed))
+    if init_centroids is not None:
+        # init_centroids is expected (K, D) per the existing contract.
+        means = init_centroids.to(device=device, dtype=dtype).unsqueeze(0).contiguous()
+    else:
+        init_idx = torch.randint(0, N, (K,), generator=rng)
+        means = x_cpu[init_idx].to(device=device, dtype=dtype).unsqueeze(0).contiguous()
+
+    # Initialize variance from a small random sample of the data.
+    sample_size = min(N, 65536)
+    sample_idx = torch.randperm(N, generator=rng)[:sample_size]
+    sample = x_cpu[sample_idx].to(device=device, dtype=dtype)
+    var_scalar = sample.float().var(dim=0).mean()
+    var = var_scalar.clamp_min(reg_covar).expand(1, K).contiguous().float() / max(K, 1)
+    var = var.clamp_min(reg_covar)
+
+    log_w = torch.full((1, K), -math.log(K), dtype=torch.float32, device=device)
+    weights = torch.full((1, K), 1.0 / K, dtype=torch.float32, device=device)
+
+    lower_bound_history: list[float] = []
+    n_iter = 0
+    prev_lb = -math.inf
+
+    for _ in range(int(max_iters)):
+        n_iter += 1
+        # Per-iteration aggregator buffers.
+        sums_total = torch.zeros((1, K, D), dtype=torch.float32, device=device)
+        sumsq_total = torch.zeros((1, K), dtype=torch.float32, device=device)
+        counts_total = torch.zeros((1, K), dtype=torch.int32, device=device)
+        lse_sum = 0.0
+        lse_count = 0
+
+        for start in range(0, N, chunk_size_data_cpu):
+            end = min(start + chunk_size_data_cpu, N)
+            chunk = x_cpu[start:end].to(device=device, dtype=dtype, non_blocking=True)
+            chunk_b = chunk.unsqueeze(0).contiguous()
+
+            ids = _cuda_mod.spherical_assign(chunk_b, means, var, log_w)
+            lse = _cuda_mod.spherical_logsumexp(chunk_b, means, var, log_w)
+            lse_sum += float(lse.sum().item())
+            lse_count += chunk_b.shape[1]
+
+            sums_c, sumsq_c, counts_c = _cuda_mod.blocked_update_spherical(chunk_b, ids, K)
+            sums_total += sums_c
+            sumsq_total += sumsq_c
+            counts_total += counts_c
+
+        means, var, weights = _cuda_mod.finalize_spherical(
+            sums_total, sumsq_total, counts_total, means, var, N, reg_covar
+        )
+        log_w = torch.log(weights.clamp_min(1e-30))
+
+        lb = lse_sum / max(lse_count, 1)
+        lower_bound_history.append(lb)
+        if abs(lb - prev_lb) < tol:
+            break
+        prev_lb = lb
+
+    # Final pass: assign cluster_ids across all chunks.
+    cluster_ids_chunks = []
+    for start in range(0, N, chunk_size_data_cpu):
+        end = min(start + chunk_size_data_cpu, N)
+        chunk = x_cpu[start:end].to(device=device, dtype=dtype, non_blocking=True)
+        chunk_b = chunk.unsqueeze(0).contiguous()
+        ids = _cuda_mod.spherical_assign(chunk_b, means, var, log_w)
+        cluster_ids_chunks.append(ids.squeeze(0).cpu())
+    cluster_ids = torch.cat(cluster_ids_chunks, dim=0)
+
+    info = {
+        "lower_bound": lower_bound_history[-1] if lower_bound_history else float("nan"),
+        "lower_bound_history": lower_bound_history,
+        "n_iter": n_iter,
+        "init_source": "cuda_random" if init_centroids is None else "cuda_provided",
+        "triton_estep_enabled": False,
+        "triton_streaming_update_enabled": False,
+        "triton_fused_update_enabled": False,
+        "triton_approx_topk_enabled": False,
+        "triton_labels_enabled": False,
+        "approximate_em_enabled": False,
+        "approx_top_k": None,
+        "large_n_streaming_enabled": True,
+        "copy_stream_prefetch_enabled": False,
+        "fallback_reason": None,
+        "backend_breakdown": {"cuda": n_iter},
+    }
+    return cluster_ids.unsqueeze(0), means, var, weights, info
+
+
 def _validate_large_n_input(x_cpu: torch.Tensor, device: torch.device) -> None:
     if x_cpu.ndim != 3:
         raise ValueError("x must have shape (B, N, D)")
@@ -488,7 +610,34 @@ def batch_gmm_largeN_cpu(
     compute_labels: bool = True,
     max_init_samples: int = 65536,
     approx_top_k: Optional[int] = None,
+    backend: str = "auto",
+    legacy_no_triton: bool = False,
 ) -> Tuple[Optional[torch.LongTensor], torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+    # Plan 10: backend dispatch.
+    from . import _dispatch
+    representative_shape = (1, 1024, x_cpu.shape[-1], int(n_components))
+    resolved = _dispatch.resolve_backend_with_env(
+        requested=backend,
+        covariance=covariance_type,
+        shape=representative_shape,
+        dtype=dtype if dtype is not None else torch.float32,
+        legacy_no_triton=legacy_no_triton,
+    )
+    if resolved == "cuda" and covariance_type == "spherical":
+        # x_cpu may be (B=1, N, D) — squeeze the batch dim for the helper.
+        x_2d = x_cpu.squeeze(0) if x_cpu.ndim == 3 else x_cpu
+        return _largen_spherical_cuda(
+            x_2d, n_components,
+            max_iters=max_iters,
+            tol=tol,
+            dtype=dtype,
+            device=device,
+            chunk_size_data_cpu=chunk_size_N,
+            seed=0,
+            reg_covar=reg_covar,
+            verbose=verbose,
+        )
+
     _validate_large_n_input(x_cpu, device)
     if covariance_type not in {"spherical", "diag", "tied", "full"}:
         raise ValueError("covariance_type must be 'spherical', 'diag', 'tied', or 'full'")
