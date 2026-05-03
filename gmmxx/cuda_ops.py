@@ -35,6 +35,13 @@ tied_logsumexp = _cuda.tied_logsumexp
 tied_resp = _cuda.tied_resp
 tied_finalize = _cuda.tied_finalize
 
+# Full (Plan 8).
+full_assign = _cuda.full_assign
+full_logsumexp = _cuda.full_logsumexp
+full_resp = _cuda.full_resp
+full_blocked_update = _cuda.full_blocked_update
+full_finalize = _cuda.full_finalize
+
 # Lifecycle / introspection helpers.
 has_cuda = _cuda.has_cuda
 require_cuda = _cuda.require_cuda
@@ -62,6 +69,11 @@ __all__ = [
     "tied_logsumexp",
     "tied_resp",
     "tied_finalize",
+    "full_assign",
+    "full_logsumexp",
+    "full_resp",
+    "full_blocked_update",
+    "full_finalize",
     "has_cuda",
     "require_cuda",
     "CudaBackendUnavailable",

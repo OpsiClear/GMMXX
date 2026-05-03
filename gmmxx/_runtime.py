@@ -77,13 +77,22 @@ def cuda_tied_supported(d: int, n_components: int, dtype) -> bool:
 
 
 def cuda_full_supported(d: int, n_components: int, dtype) -> bool:
-    """True iff the CUDA backend can handle full-covariance EM at this shape+dtype.
+    """True iff the full CUDA backend can handle this shape+dtype.
 
-    Plan 1 stub: returns False until Plan 5. Note the spec's D <= 16 cap is
-    enforced once the kernel exists; for now the stub simply refuses everything.
+    Plan 8: D <= 16, K <= 32, dtype in {fp32, fp16, bf16}. Tighter window
+    than spherical/diag/tied because each cluster has an O(D²) precision
+    representation.
     """
-    del d, n_components, dtype
-    return False
+    import torch as _torch
+    if dtype is None:
+        return False
+    if dtype not in (_torch.float32, _torch.float16, _torch.bfloat16):
+        return False
+    if not (0 < d <= 16):
+        return False
+    if not (0 < n_components <= 32):
+        return False
+    return True
 
 
 def cuda_spherical_fused_supported(d: int, n_components: int, dtype) -> bool:
