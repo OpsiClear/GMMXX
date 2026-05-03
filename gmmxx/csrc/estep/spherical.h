@@ -4,6 +4,8 @@
 
 namespace gmmxx { namespace estep { namespace spherical {
 
+// Public dispatchers (Plan 3 Task 3 implements these in spherical_dispatch.cu).
+//
 // Hard-assign cluster IDs (argmax of log p_k(x) over k).
 // Returns int32 tensor of shape (B, N).
 //
@@ -17,21 +19,63 @@ at::Tensor assign(const at::Tensor& x,
                   const at::Tensor& log_w,
                   c10::optional<at::Tensor> out);
 
-// Per-row stable logsumexp over K. Returns (B, N) fp32.
 at::Tensor logsumexp(const at::Tensor& x,
                      const at::Tensor& means,
                      const at::Tensor& var,
                      const at::Tensor& log_w,
                      c10::optional<at::Tensor> out);
 
-// Soft responsibilities r_{n,k} = exp(log p_k - log_norm). Returns (B, N, K) fp32.
-//
-// log_norm: (B, N) fp32. Caller supplies; typically obtained from logsumexp().
 at::Tensor resp(const at::Tensor& x,
                 const at::Tensor& means,
                 const at::Tensor& var,
                 const at::Tensor& log_w,
                 const at::Tensor& log_norm,
                 c10::optional<at::Tensor> out);
+
+// Safe-path implementations (renamed from Plan 2's public functions).
+at::Tensor assign_safe(const at::Tensor& x,
+                       const at::Tensor& means,
+                       const at::Tensor& var,
+                       const at::Tensor& log_w,
+                       c10::optional<at::Tensor> out);
+
+at::Tensor logsumexp_safe(const at::Tensor& x,
+                          const at::Tensor& means,
+                          const at::Tensor& var,
+                          const at::Tensor& log_w,
+                          c10::optional<at::Tensor> out);
+
+at::Tensor resp_safe(const at::Tensor& x,
+                     const at::Tensor& means,
+                     const at::Tensor& var,
+                     const at::Tensor& log_w,
+                     const at::Tensor& log_norm,
+                     c10::optional<at::Tensor> out);
+
+// sm_80+ mma path (fp16/bf16 only). Caller precomputes x_sq/c_sq fp32 norms.
+at::Tensor assign_sm80(const at::Tensor& x,
+                       const at::Tensor& means,
+                       const at::Tensor& var,
+                       const at::Tensor& log_w,
+                       const at::Tensor& x_sq,
+                       const at::Tensor& c_sq,
+                       c10::optional<at::Tensor> out);
+
+at::Tensor logsumexp_sm80(const at::Tensor& x,
+                          const at::Tensor& means,
+                          const at::Tensor& var,
+                          const at::Tensor& log_w,
+                          const at::Tensor& x_sq,
+                          const at::Tensor& c_sq,
+                          c10::optional<at::Tensor> out);
+
+at::Tensor resp_sm80(const at::Tensor& x,
+                     const at::Tensor& means,
+                     const at::Tensor& var,
+                     const at::Tensor& log_w,
+                     const at::Tensor& x_sq,
+                     const at::Tensor& c_sq,
+                     const at::Tensor& log_norm,
+                     c10::optional<at::Tensor> out);
 
 }}}  // namespace gmmxx::estep::spherical

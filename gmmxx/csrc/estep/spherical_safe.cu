@@ -230,9 +230,9 @@ void launch_resp(const at::Tensor& x, const at::Tensor& means,
 
 }  // anonymous namespace
 
-at::Tensor assign(const at::Tensor& x, const at::Tensor& means,
-                  const at::Tensor& var, const at::Tensor& log_w,
-                  c10::optional<at::Tensor> out) {
+at::Tensor assign_safe(const at::Tensor& x, const at::Tensor& means,
+                       const at::Tensor& var, const at::Tensor& log_w,
+                       c10::optional<at::Tensor> out) {
     _check_inputs(x, means, var, log_w);
     c10::cuda::CUDAGuard guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -253,14 +253,21 @@ at::Tensor assign(const at::Tensor& x, const at::Tensor& means,
         case at::kFloat:    launch_assign<float>(x, means, var, log_w, result, stream); break;
         case at::kHalf:     launch_assign<at::Half>(x, means, var, log_w, result, stream); break;
         case at::kBFloat16: launch_assign<at::BFloat16>(x, means, var, log_w, result, stream); break;
-        default: TORCH_CHECK(false, "spherical.assign: unsupported dtype ", x.scalar_type());
+        default: TORCH_CHECK(false, "spherical.assign_safe: unsupported dtype ", x.scalar_type());
     }
     return result;
 }
 
-at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
-                     const at::Tensor& var, const at::Tensor& log_w,
-                     c10::optional<at::Tensor> out) {
+// Public dispatcher stub — Plan 3 Task 3 will replace this with routing logic.
+at::Tensor assign(const at::Tensor& x, const at::Tensor& means,
+                  const at::Tensor& var, const at::Tensor& log_w,
+                  c10::optional<at::Tensor> out) {
+    return assign_safe(x, means, var, log_w, std::move(out));
+}
+
+at::Tensor logsumexp_safe(const at::Tensor& x, const at::Tensor& means,
+                          const at::Tensor& var, const at::Tensor& log_w,
+                          c10::optional<at::Tensor> out) {
     _check_inputs(x, means, var, log_w);
     c10::cuda::CUDAGuard guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -281,15 +288,22 @@ at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
         case at::kFloat:    launch_logsumexp<float>(x, means, var, log_w, result, stream); break;
         case at::kHalf:     launch_logsumexp<at::Half>(x, means, var, log_w, result, stream); break;
         case at::kBFloat16: launch_logsumexp<at::BFloat16>(x, means, var, log_w, result, stream); break;
-        default: TORCH_CHECK(false, "spherical.logsumexp: unsupported dtype ", x.scalar_type());
+        default: TORCH_CHECK(false, "spherical.logsumexp_safe: unsupported dtype ", x.scalar_type());
     }
     return result;
 }
 
-at::Tensor resp(const at::Tensor& x, const at::Tensor& means,
-                const at::Tensor& var, const at::Tensor& log_w,
-                const at::Tensor& log_norm,
-                c10::optional<at::Tensor> out) {
+// Public dispatcher stub — Plan 3 Task 3 will replace this with routing logic.
+at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
+                     const at::Tensor& var, const at::Tensor& log_w,
+                     c10::optional<at::Tensor> out) {
+    return logsumexp_safe(x, means, var, log_w, std::move(out));
+}
+
+at::Tensor resp_safe(const at::Tensor& x, const at::Tensor& means,
+                     const at::Tensor& var, const at::Tensor& log_w,
+                     const at::Tensor& log_norm,
+                     c10::optional<at::Tensor> out) {
     _check_inputs(x, means, var, log_w);
     TORCH_CHECK(log_norm.is_cuda() && log_norm.is_contiguous() &&
                 log_norm.scalar_type() == at::kFloat &&
@@ -315,9 +329,17 @@ at::Tensor resp(const at::Tensor& x, const at::Tensor& means,
         case at::kFloat:    launch_resp<float>(x, means, var, log_w, log_norm, result, stream); break;
         case at::kHalf:     launch_resp<at::Half>(x, means, var, log_w, log_norm, result, stream); break;
         case at::kBFloat16: launch_resp<at::BFloat16>(x, means, var, log_w, log_norm, result, stream); break;
-        default: TORCH_CHECK(false, "spherical.resp: unsupported dtype ", x.scalar_type());
+        default: TORCH_CHECK(false, "spherical.resp_safe: unsupported dtype ", x.scalar_type());
     }
     return result;
+}
+
+// Public dispatcher stub — Plan 3 Task 3 will replace this with routing logic.
+at::Tensor resp(const at::Tensor& x, const at::Tensor& means,
+                const at::Tensor& var, const at::Tensor& log_w,
+                const at::Tensor& log_norm,
+                c10::optional<at::Tensor> out) {
+    return resp_safe(x, means, var, log_w, log_norm, std::move(out));
 }
 
 }}}  // namespace gmmxx::estep::spherical

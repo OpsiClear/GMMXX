@@ -114,6 +114,7 @@ def _build_extension():
         str(CSRC / "bindings.cpp"),
         str(CSRC / "canary" / "canary.cu"),
         str(CSRC / "estep" / "spherical_safe.cu"),
+        str(CSRC / "estep" / "spherical_sm80.cu"),
         str(CSRC / "mstep" / "blocked_spherical.cu"),
         str(CSRC / "mstep" / "finalize_spherical.cu"),
         str(nb_combined),
