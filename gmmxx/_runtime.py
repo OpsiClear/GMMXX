@@ -40,12 +40,22 @@ def cuda_spherical_supported(d: int, n_components: int, dtype) -> bool:
 
 
 def cuda_diag_supported(d: int, n_components: int, dtype) -> bool:
-    """True iff the CUDA backend can handle diagonal EM at this shape+dtype.
+    """True iff the diagonal CUDA backend can handle this shape+dtype.
 
-    Plan 1 stub: returns False until Plan 3.
+    Plan 6 (safe path): supports d in (0, 64] and n_components in (0, 512]
+    for dtype in {fp32, fp16, bf16}. Outside this window, the dispatcher
+    falls back to Triton or torch.
     """
-    del d, n_components, dtype
-    return False
+    import torch as _torch
+    if dtype is None:
+        return False
+    if dtype not in (_torch.float32, _torch.float16, _torch.bfloat16):
+        return False
+    if not (0 < d <= 64):
+        return False
+    if not (0 < n_components <= 512):
+        return False
+    return True
 
 
 def cuda_tied_supported(d: int, n_components: int, dtype) -> bool:

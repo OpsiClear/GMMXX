@@ -259,6 +259,127 @@ def finalize_spherical(
         raise CudaRuntimeFallback(f"finalize_spherical failed: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# Diagonal kernels (Plan 6 — safe path)
+# ---------------------------------------------------------------------------
+
+
+def diag_assign(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Diagonal E-step assign. Returns int32 (B, N)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    var = _check_input(var, "var", dtype=torch.float32)
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    try:
+        return _C.diag_assign(x, means, var, log_w, out)
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"diag_assign failed: {exc}") from exc
+
+
+def diag_logsumexp(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Diagonal E-step logsumexp. Returns fp32 (B, N)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    var = _check_input(var, "var", dtype=torch.float32)
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    try:
+        return _C.diag_logsumexp(x, means, var, log_w, out)
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"diag_logsumexp failed: {exc}") from exc
+
+
+def diag_resp(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    log_norm: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Diagonal E-step responsibilities. Returns fp32 (B, N, K)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    var = _check_input(var, "var", dtype=torch.float32)
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    log_norm = _check_input(log_norm, "log_norm", dtype=torch.float32)
+    try:
+        return _C.diag_resp(x, means, var, log_w, log_norm, out)
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"diag_resp failed: {exc}") from exc
+
+
+def blocked_update_diag(
+    x: torch.Tensor,
+    cluster_ids: torch.Tensor,
+    n_components: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Diagonal M-step accumulator. Allocates and zero-initializes
+    sums (B,K,D), sumsq (B,K,D), counts (B,K)."""
+    require_cuda()
+    x = _check_input(x, "x")
+    cluster_ids = _check_input(cluster_ids, "cluster_ids", dtype=torch.int32)
+    B, N, D = x.shape
+    K = int(n_components)
+    sums = torch.zeros((B, K, D), dtype=torch.float32, device=x.device)
+    sumsq = torch.zeros((B, K, D), dtype=torch.float32, device=x.device)
+    counts = torch.zeros((B, K), dtype=torch.int32, device=x.device)
+    try:
+        _C.blocked_update_diag(x, cluster_ids, sums, sumsq, counts)
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"blocked_update_diag failed: {exc}") from exc
+    return sums, sumsq, counts
+
+
+def finalize_diag(
+    sums: torch.Tensor,
+    sumsq: torch.Tensor,
+    counts: torch.Tensor,
+    old_means: torch.Tensor,
+    old_var: torch.Tensor,
+    total_n: int,
+    reg_covar: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Diagonal M-step finalize. Returns (means (B,K,D), var (B,K,D), weights (B,K))."""
+    require_cuda()
+    sums = _check_input(sums, "sums", dtype=torch.float32)
+    sumsq = _check_input(sumsq, "sumsq", dtype=torch.float32)
+    counts = _check_input(counts, "counts", dtype=torch.int32)
+    old_means = _check_input(old_means, "old_means")
+    old_var = _check_input(old_var, "old_var", dtype=torch.float32)
+    try:
+        return _C.finalize_diag(
+            sums, sumsq, counts, old_means, old_var,
+            int(total_n), float(reg_covar),
+        )
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"finalize_diag failed: {exc}") from exc
+
+
 def fused_spherical(
     x: torch.Tensor,
     means: torch.Tensor,

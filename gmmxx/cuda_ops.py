@@ -20,6 +20,13 @@ blocked_update_spherical_sorted = _cuda.blocked_update_spherical_sorted
 finalize_spherical = _cuda.finalize_spherical
 fused_spherical = _cuda.fused_spherical
 
+# Diagonal (Plan 6).
+diag_assign = _cuda.diag_assign
+diag_logsumexp = _cuda.diag_logsumexp
+diag_resp = _cuda.diag_resp
+blocked_update_diag = _cuda.blocked_update_diag
+finalize_diag = _cuda.finalize_diag
+
 # Lifecycle / introspection helpers.
 has_cuda = _cuda.has_cuda
 require_cuda = _cuda.require_cuda
@@ -36,6 +43,11 @@ __all__ = [
     "blocked_update_spherical_sorted",
     "finalize_spherical",
     "fused_spherical",
+    "diag_assign",
+    "diag_logsumexp",
+    "diag_resp",
+    "blocked_update_diag",
+    "finalize_diag",
     "has_cuda",
     "require_cuda",
     "CudaBackendUnavailable",
