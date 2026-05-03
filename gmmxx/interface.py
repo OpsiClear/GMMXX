@@ -697,6 +697,80 @@ class GMMXX:
             batch_size=batch_size,
         )
 
+    def _train_full_cuda(self, x_b: torch.Tensor, batch_size: Optional[int]) -> None:
+        """Full-covariance EM loop on the CUDA backend (D <= 16, K <= 32)."""
+        import math
+        from . import _cuda as _cuda_mod
+
+        B, N, D = x_b.shape
+        K = self.k
+        device = x_b.device
+
+        # Init: random means; per-cluster L_k = sqrt(data_var) * I (isotropic).
+        rng = torch.Generator(device=device).manual_seed(self.seed)
+        init_idx = torch.randint(0, N, (B, K), generator=rng, device=device)
+        means = torch.gather(
+            x_b, 1, init_idx.unsqueeze(-1).expand(-1, -1, D)
+        ).contiguous()
+        data_var_scalar = x_b.float().var(dim=1).mean(-1, keepdim=True)  # (B, 1)
+        sqrt_var = data_var_scalar.clamp_min(self.reg_covar).sqrt().view(B, 1, 1, 1)
+        eye = torch.eye(D, device=device, dtype=x_b.dtype).view(1, 1, D, D)
+        L = (sqrt_var.to(x_b.dtype) * eye.expand(B, K, D, D)).contiguous()  # (B, K, D, D)
+        log_w = torch.full((B, K), -math.log(K), dtype=torch.float32, device=device)
+        weights = torch.full((B, K), 1.0 / K, dtype=torch.float32, device=device)
+
+        lower_bound_history: list[float] = []
+        n_iter = 0
+        prev_lb = -math.inf
+        lb = float("-inf")
+        ids: Optional[torch.Tensor] = None
+
+        for _ in range(self.niter):
+            n_iter += 1
+            ids = _cuda_mod.full_assign(x_b, means, L, log_w)
+            lse = _cuda_mod.full_logsumexp(x_b, means, L, log_w)
+            lb = float(lse.mean().item())
+            lower_bound_history.append(lb)
+
+            sums, outer_sums, counts = _cuda_mod.full_blocked_update(x_b, ids, K)
+            means, L, weights = _cuda_mod.full_finalize(
+                sums, outer_sums, counts, means, L, N, self.reg_covar
+            )
+            log_w = torch.log(weights.clamp_min(1e-30))
+
+            if abs(lb - prev_lb) < self.tol:
+                break
+            prev_lb = lb
+
+        # GMMXX exposes covariances_ as the full (B, K, D, D) Σ_k.
+        cov_b = L @ L.transpose(-1, -2)  # (B, K, D, D)
+
+        labels_b = ids if (self.compute_labels_on_fit and ids is not None) else None
+        info = {
+            "lower_bound": lb,
+            "lower_bound_history": lower_bound_history,
+            "n_iter": n_iter,
+            "init_source": "cuda_random",
+            "triton_estep_enabled": False,
+            "triton_streaming_update_enabled": False,
+            "triton_fused_update_enabled": False,
+            "triton_approx_topk_enabled": False,
+            "triton_labels_enabled": False,
+            "approximate_em_enabled": False,
+            "approx_top_k": None,
+            "large_n_streaming_enabled": False,
+            "copy_stream_prefetch_enabled": False,
+            "backend_breakdown": {"cuda": n_iter},
+        }
+        self._set_fit_result(
+            labels_b=labels_b,
+            means_b=means,
+            variances_b=cov_b,  # (B, K, D, D)
+            weights_b=weights,
+            info=info,
+            batch_size=batch_size,
+        )
+
     def train(self, data: torch.Tensor):
         self._apply_matmul_precision()
         self._reset_fit_state()
@@ -848,6 +922,33 @@ class GMMXX:
                 approx_top_k=self.approx_top_k,
             )
         else:
+            # covariance_type == "full"
+            # CUDA backend dispatch — when resolver picks "cuda", run the
+            # standalone EM loop in _train_full_cuda and return early.
+            # The CUDA path does not implement approximate top-k EM, so
+            # when approx_top_k is requested we skip the CUDA dispatch and let
+            # the existing Triton/torch path handle it.
+            if self.approx_top_k is None:
+                from . import _dispatch
+                shape_for_dispatch = (
+                    x_b.shape[0],
+                    x_b.shape[1],
+                    x_b.shape[2],
+                    self.k,
+                )
+                resolved = _dispatch.resolve_backend_with_env(
+                    requested=self.backend,
+                    covariance="full",
+                    shape=shape_for_dispatch,
+                    dtype=x_b.dtype,
+                    legacy_no_triton=self._legacy_no_triton,
+                )
+                if resolved == "cuda":
+                    self._train_full_cuda(x_b, batch_size)
+                    self.last_backend_used_ = "cuda"
+                    self.cuda_estep_enabled_ = True
+                    return
+                self.last_backend_used_ = resolved
             labels_b, means_b, variances_b, weights_b, info = batch_gmm_Full_torch_native(
                 x_b,
                 self.k,
@@ -1224,6 +1325,30 @@ class GMMXX:
             )
             return labels_b.squeeze(0) if batch_size is None else labels_b
         if self.covariance_type == "full":
+            # CUDA branch (Plan 8 Task 5).
+            from . import _dispatch
+            shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="full",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                from . import _cuda as _cuda_mod
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                L, _ = torch.linalg.cholesky_ex(self.covariances_b)
+                ids_b = _cuda_mod.full_assign(x_b_compute, means_b, L, log_w)
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(ids_b).long()
+            self.last_backend_used_ = resolved
             if self._use_triton_full_inference(x_b):
                 try:
                     precision, precision_means, mean_precision_mean, logdet, log_weights = self._full_inference_terms()
@@ -1470,6 +1595,31 @@ class GMMXX:
                 )
             return probs_b.squeeze(0) if batch_size is None else probs_b
         if self.covariance_type == "full":
+            # CUDA branch (Plan 8 Task 5).
+            from . import _dispatch
+            shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="full",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                from . import _cuda as _cuda_mod
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                L, _ = torch.linalg.cholesky_ex(self.covariances_b)
+                log_norm = _cuda_mod.full_logsumexp(x_b_compute, means_b, L, log_w)
+                proba_b = _cuda_mod.full_resp(x_b_compute, means_b, L, log_w, log_norm)
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(proba_b)
+            self.last_backend_used_ = resolved
             if self._use_triton_full_inference(x_b):
                 try:
                     precision, precision_means, mean_precision_mean, logdet, log_weights = self._full_inference_terms()
@@ -1713,6 +1863,30 @@ class GMMXX:
                 )
             return scores_b.squeeze(0) if batch_size is None else scores_b
         if self.covariance_type == "full":
+            # CUDA branch (Plan 8 Task 5).
+            from . import _dispatch
+            shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="full",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                from . import _cuda as _cuda_mod
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                L, _ = torch.linalg.cholesky_ex(self.covariances_b)
+                ll_b = _cuda_mod.full_logsumexp(x_b_compute, means_b, L, log_w)
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(ll_b)
+            self.last_backend_used_ = resolved
             if self._use_triton_full_inference(x_b):
                 try:
                     precision, precision_means, mean_precision_mean, logdet, log_weights = self._full_inference_terms()
