@@ -4,6 +4,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from gmmxx import _dispatch
 
@@ -50,15 +51,22 @@ class TestResolveBackend:
         )
         assert result == "torch"
 
-    def test_explicit_cuda_falls_through_when_stub_returns_false(self):
-        # Plan 1 stub always returns False, so cuda must fall to torch.
+    def test_explicit_cuda_returns_cuda_when_spherical_supported(self):
+        # Plan 2: cuda_spherical_supported now returns True for d=32 k=64 fp32.
+        # If the host has CUDA available, this resolves to "cuda".
+        # On CPU-only hosts, _cuda.has_cuda() is False, so it falls through to "torch".
         result = _dispatch.resolve_backend(
             requested="cuda",
             covariance="spherical",
             shape=(1, 1024, 32, 64),
-            dtype=None,
+            dtype=torch.float32,
         )
-        assert result == "torch"
+        # Either outcome is correct; depends on host:
+        from gmmxx import _cuda as _cuda_mod
+        if _cuda_mod.has_cuda():
+            assert result == "cuda"
+        else:
+            assert result == "torch"
 
     def test_auto_picks_triton_on_supported_shape_when_cuda_stub_false(self):
         # cuda stub False → fallback to triton when supported.

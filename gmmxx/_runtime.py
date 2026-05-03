@@ -20,14 +20,23 @@ def triton_spherical_supported(d: int, n_components: int) -> bool:
 # them as kernels land).
 
 def cuda_spherical_supported(d: int, n_components: int, dtype) -> bool:
-    """True iff the CUDA backend can handle spherical EM at this shape+dtype.
+    """True iff the spherical CUDA backend can handle this shape+dtype.
 
-    Plan 1 stub: returns False until Plan 2 implements the spherical kernels.
-    The dispatcher uses this gate to decide whether to route through CUDA;
-    when False, it falls back to Triton or torch.
+    Plan 2 (safe path): supports d in (0, 128] and n_components in (0, 2048]
+    for dtype in {fp32, fp16, bf16}. Plan 3 will widen the dtype dispatch to
+    route fp16/bf16 to the sm80 mma kernel; Plan 2's safe kernel handles all
+    three but at SIMT speed.
     """
-    del d, n_components, dtype  # unused until Plan 2
-    return False
+    import torch as _torch
+    if dtype is None:
+        return False  # caller didn't supply dtype; conservative no.
+    if dtype not in (_torch.float32, _torch.float16, _torch.bfloat16):
+        return False
+    if not (0 < d <= 128):
+        return False
+    if not (0 < n_components <= 2048):
+        return False
+    return True
 
 
 def cuda_diag_supported(d: int, n_components: int, dtype) -> bool:
