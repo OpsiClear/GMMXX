@@ -75,45 +75,4 @@ NB_MODULE(_C, m) {
         "Finalize spherical M-step. Returns (means, var, weights). "
         "Empty clusters preserve previous (means, var) and get weight 0.");
 
-    // sm_80 mma-path E-step (Plan 3 Task 2 — internal; Task 3 will route
-    // through spherical_assign etc. instead of these direct entry-points).
-    m.def(
-        "spherical_assign_sm80",
-        &gmmxx::estep::spherical::assign_sm80,
-        nb::arg("x"),
-        nb::arg("means"),
-        nb::arg("var"),
-        nb::arg("log_w"),
-        nb::arg("x_sq"),
-        nb::arg("c_sq"),
-        nb::arg("out") = nb::none(),
-        "internal — use spherical_assign instead. "
-        "sm_80 mma.sync E-step assign for fp16/bf16. Returns int32 (B,N).");
-
-    m.def(
-        "spherical_logsumexp_sm80",
-        &gmmxx::estep::spherical::logsumexp_sm80,
-        nb::arg("x"),
-        nb::arg("means"),
-        nb::arg("var"),
-        nb::arg("log_w"),
-        nb::arg("x_sq"),
-        nb::arg("c_sq"),
-        nb::arg("out") = nb::none(),
-        "internal — use spherical_logsumexp instead. "
-        "sm_80 mma.sync E-step logsumexp (currently stubbed to safe path).");
-
-    m.def(
-        "spherical_resp_sm80",
-        &gmmxx::estep::spherical::resp_sm80,
-        nb::arg("x"),
-        nb::arg("means"),
-        nb::arg("var"),
-        nb::arg("log_w"),
-        nb::arg("x_sq"),
-        nb::arg("c_sq"),
-        nb::arg("log_norm"),
-        nb::arg("out") = nb::none(),
-        "internal — use spherical_resp instead. "
-        "sm_80 mma.sync E-step resp (currently stubbed to safe path).");
 }

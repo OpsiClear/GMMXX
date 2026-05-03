@@ -258,13 +258,6 @@ at::Tensor assign_safe(const at::Tensor& x, const at::Tensor& means,
     return result;
 }
 
-// Public dispatcher stub — Plan 3 Task 3 will replace this with routing logic.
-at::Tensor assign(const at::Tensor& x, const at::Tensor& means,
-                  const at::Tensor& var, const at::Tensor& log_w,
-                  c10::optional<at::Tensor> out) {
-    return assign_safe(x, means, var, log_w, std::move(out));
-}
-
 at::Tensor logsumexp_safe(const at::Tensor& x, const at::Tensor& means,
                           const at::Tensor& var, const at::Tensor& log_w,
                           c10::optional<at::Tensor> out) {
@@ -291,13 +284,6 @@ at::Tensor logsumexp_safe(const at::Tensor& x, const at::Tensor& means,
         default: TORCH_CHECK(false, "spherical.logsumexp_safe: unsupported dtype ", x.scalar_type());
     }
     return result;
-}
-
-// Public dispatcher stub — Plan 3 Task 3 will replace this with routing logic.
-at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
-                     const at::Tensor& var, const at::Tensor& log_w,
-                     c10::optional<at::Tensor> out) {
-    return logsumexp_safe(x, means, var, log_w, std::move(out));
 }
 
 at::Tensor resp_safe(const at::Tensor& x, const at::Tensor& means,
@@ -332,14 +318,6 @@ at::Tensor resp_safe(const at::Tensor& x, const at::Tensor& means,
         default: TORCH_CHECK(false, "spherical.resp_safe: unsupported dtype ", x.scalar_type());
     }
     return result;
-}
-
-// Public dispatcher stub — Plan 3 Task 3 will replace this with routing logic.
-at::Tensor resp(const at::Tensor& x, const at::Tensor& means,
-                const at::Tensor& var, const at::Tensor& log_w,
-                const at::Tensor& log_norm,
-                c10::optional<at::Tensor> out) {
-    return resp_safe(x, means, var, log_w, log_norm, std::move(out));
 }
 
 }}}  // namespace gmmxx::estep::spherical
