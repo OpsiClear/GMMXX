@@ -448,12 +448,23 @@ class GMMXX:
           2. Initialize variances and weights uniformly.
           3. EM loop: assign -> blocked_update -> finalize -> check ELBO.
           4. Call _set_fit_result with the final tensors.
+
+        When cuda_spherical_fused_supported(D, K, dtype) is True (D <= 64,
+        K <= 128), each EM iteration uses the fused single-tile kernel which
+        combines logit computation, soft-EM responsibilities, per-cluster
+        accumulation, and finalization in one kernel pass instead of four.
         """
         from . import _cuda as _cuda_mod
+        from . import _runtime as _gm_runtime
 
         B, N, D = x_b.shape
         K = self.k
         device = x_b.device
+
+        # Decide once per fit() whether the fused path is available for this
+        # (D, K, dtype). The shape doesn't change across iterations.
+        use_fused = _gm_runtime.cuda_spherical_fused_supported(D, K, x_b.dtype)
+        self.cuda_fused_update_enabled_ = bool(use_fused)
 
         # Initialize means by sampling from the data.
         rng = torch.Generator(device=device).manual_seed(self.seed)
@@ -478,20 +489,27 @@ class GMMXX:
 
         for _ in range(self.niter):
             n_iter += 1
-            ids = _cuda_mod.spherical_assign(x_b, means, var, log_w)
-            lse = _cuda_mod.spherical_logsumexp(x_b, means, var, log_w)
-            lb = float(lse.mean().item())
+            if use_fused:
+                means, var, weights, lse, ids = _cuda_mod.fused_spherical(
+                    x_b, means, var, log_w, self.reg_covar
+                )
+                log_w = torch.log(weights.clamp_min(1e-30))
+                lb = float(lse.mean().item())
+            else:
+                ids = _cuda_mod.spherical_assign(x_b, means, var, log_w)
+                lse = _cuda_mod.spherical_logsumexp(x_b, means, var, log_w)
+                lb = float(lse.mean().item())
+
+                sums, sumsq, counts = _cuda_mod.blocked_update_spherical(
+                    x_b, ids, K,
+                    force_sort=getattr(self, "_force_sort", None),
+                )
+                means, var, weights = _cuda_mod.finalize_spherical(
+                    sums, sumsq, counts, means, var, N, self.reg_covar
+                )
+                log_w = torch.log(weights.clamp_min(1e-30))
+
             lower_bound_history.append(lb)
-
-            sums, sumsq, counts = _cuda_mod.blocked_update_spherical(
-                x_b, ids, K,
-                force_sort=getattr(self, "_force_sort", None),
-            )
-            means, var, weights = _cuda_mod.finalize_spherical(
-                sums, sumsq, counts, means, var, N, self.reg_covar
-            )
-            log_w = torch.log(weights.clamp_min(1e-30))
-
             if abs(lb - prev_lb) < self.tol:
                 break
             prev_lb = lb
