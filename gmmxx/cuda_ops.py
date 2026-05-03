@@ -18,6 +18,7 @@ spherical_resp = _cuda.spherical_resp
 blocked_update_spherical = _cuda.blocked_update_spherical
 blocked_update_spherical_sorted = _cuda.blocked_update_spherical_sorted
 finalize_spherical = _cuda.finalize_spherical
+fused_spherical = _cuda.fused_spherical
 
 # Lifecycle / introspection helpers.
 has_cuda = _cuda.has_cuda
@@ -34,6 +35,7 @@ __all__ = [
     "blocked_update_spherical",
     "blocked_update_spherical_sorted",
     "finalize_spherical",
+    "fused_spherical",
     "has_cuda",
     "require_cuda",
     "CudaBackendUnavailable",

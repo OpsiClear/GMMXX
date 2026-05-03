@@ -257,3 +257,38 @@ def finalize_spherical(
         if _no_fallback():
             raise
         raise CudaRuntimeFallback(f"finalize_spherical failed: {exc}") from exc
+
+
+def fused_spherical(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    reg_covar: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused E/M single-tile spherical kernel.
+
+    Combines logit computation, softmax responsibilities, and per-cluster
+    sufficient-statistic accumulation in a single CTA pass. Constraints:
+    D <= 64, K <= 128. Caller is responsible for checking the support
+    window via gmmxx._runtime.cuda_spherical_fused_supported.
+
+    Returns (new_means, new_var, new_weights, lse_per_sample, labels)
+    where:
+      new_means: (B, K, D) same dtype as input means.
+      new_var: (B, K) fp32 (clamped to >= reg_covar).
+      new_weights: (B, K) fp32 (sum to 1 per batch when N > 0).
+      lse_per_sample: (B, N) fp32 — per-sample log-likelihood; mean is the ELBO.
+      labels: (B, N) int32 — argmax of responsibilities (= argmax of logits).
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    var = _check_input(var, "var", dtype=torch.float32)
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    try:
+        return _C.spherical_fused(x, means, var, log_w, float(reg_covar))
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"fused_spherical failed: {exc}") from exc
