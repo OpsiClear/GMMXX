@@ -895,3 +895,57 @@ def test_spherical_full_pipeline_each_backend(backend):
     assert gmm.last_backend_used_ in {backend, "torch"}, (
         f"expected last_backend_used_ in {{{backend!r}, 'torch'}}, got {gmm.last_backend_used_!r}"
     )
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton", "cuda"])
+def test_diag_full_pipeline_each_backend(backend):
+    """End-to-end fit → predict → predict_proba → score_samples → score
+    under each backend for diagonal covariance."""
+    if not _backend_available(backend):
+        pytest.skip(f"backend {backend!r} not available")
+
+    import math
+
+    if backend == "torch":
+        device = "cpu"
+    else:
+        if not torch.cuda.is_available():
+            pytest.skip(f"backend {backend!r} requires CUDA")
+        device = "cuda"
+
+    torch.manual_seed(0)
+    x_train = torch.randn(2048, 16, device=device)
+    x_test = torch.randn(256, 16, device=device)
+
+    gmm = GMMXX(
+        n_components=6,
+        max_iter=15,
+        tol=1e-4,
+        random_state=0,
+        covariance_type="diag",
+        backend=backend,
+    )
+    gmm.fit(x_train)
+
+    labels = gmm.predict(x_test)
+    proba = gmm.predict_proba(x_test)
+    ll = gmm.score_samples(x_test)
+    s = gmm.score(x_test)
+
+    assert labels.shape == (256,)
+    assert labels.dtype in (torch.long, torch.int32)
+    assert proba.shape == (256, 6)
+    assert torch.allclose(
+        proba.sum(-1), torch.ones(256, device=proba.device), atol=1e-3
+    )
+    assert ll.shape == (256,)
+    assert torch.isfinite(ll).all()
+    assert isinstance(s, float)
+    assert math.isfinite(s)
+    # Diag covariance is (K, D) per-feature.
+    assert gmm.covariances_.shape == (6, 16)
+    # last_backend_used_ should match backend or fall back to torch.
+    assert gmm.last_backend_used_ in {backend, "torch"}, (
+        f"expected last_backend_used_ in {{{backend!r}, 'torch'}}, "
+        f"got {gmm.last_backend_used_!r}"
+    )
