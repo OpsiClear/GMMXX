@@ -1190,6 +1190,30 @@ class GMMXX:
                 )
             return labels_b.squeeze(0) if batch_size is None else labels_b
         if self.covariance_type == "tied":
+            # CUDA branch (Plan 7 Task 5).
+            from . import _dispatch
+            shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="tied",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                from . import _cuda as _cuda_mod
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                L = torch.linalg.cholesky(self.covariances_b)
+                ids_b = _cuda_mod.tied_assign(x_b_compute, means_b, L, log_w)
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(ids_b).long()
+            self.last_backend_used_ = resolved
             labels_b = tied_assign_torch_native_chunked(
                 x_b,
                 self.means_b,
@@ -1369,6 +1393,31 @@ class GMMXX:
                 )
             return probs_b.squeeze(0) if batch_size is None else probs_b
         if self.covariance_type == "tied":
+            # CUDA branch (Plan 7 Task 5).
+            from . import _dispatch
+            shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="tied",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                from . import _cuda as _cuda_mod
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                L = torch.linalg.cholesky(self.covariances_b)
+                log_norm = _cuda_mod.tied_logsumexp(x_b_compute, means_b, L, log_w)
+                proba_b = _cuda_mod.tied_resp(x_b_compute, means_b, L, log_w, log_norm)
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(proba_b)
+            self.last_backend_used_ = resolved
             if self._use_triton_tied_inference(x_b):
                 try:
                     (
@@ -1597,6 +1646,30 @@ class GMMXX:
                 )
             return scores_b.squeeze(0) if batch_size is None else scores_b
         if self.covariance_type == "tied":
+            # CUDA branch (Plan 7 Task 5).
+            from . import _dispatch
+            shape_for_dispatch = (x_b.shape[0], x_b.shape[1], x_b.shape[2], self.k)
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="tied",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                from . import _cuda as _cuda_mod
+                if self.dtype is not None and x_b.dtype != self.dtype:
+                    x_b_compute = x_b.to(self.dtype)
+                    means_b = self.means_b.to(self.dtype)
+                else:
+                    x_b_compute = x_b
+                    means_b = self.means_b
+                log_w = torch.log(self.weights_b.clamp_min(1e-30))
+                L = torch.linalg.cholesky(self.covariances_b)
+                ll_b = _cuda_mod.tied_logsumexp(x_b_compute, means_b, L, log_w)
+                self.last_backend_used_ = "cuda"
+                return self._squeeze_if_unbatched(ll_b)
+            self.last_backend_used_ = resolved
             if self._use_triton_tied_inference(x_b):
                 try:
                     (
