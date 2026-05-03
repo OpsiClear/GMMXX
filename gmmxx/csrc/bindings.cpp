@@ -63,6 +63,16 @@ NB_MODULE(_C, m) {
         "sums_out/sumsq_out/counts_out before calling.");
 
     m.def(
+        "blocked_update_spherical_sorted",
+        &gmmxx::mstep::spherical::blocked_update_sorted,
+        nb::arg("x_sorted"),
+        nb::arg("sorted_ids"),
+        nb::arg("sums_out"),
+        nb::arg("sumsq_out"),
+        nb::arg("counts_out"),
+        "Sorted-run spherical M-step. Caller pre-sorts cluster_ids and gathers x.");
+
+    m.def(
         "finalize_spherical",
         &gmmxx::mstep::spherical::finalize,
         nb::arg("sums"),

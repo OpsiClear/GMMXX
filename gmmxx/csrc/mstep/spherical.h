@@ -20,6 +20,14 @@ void blocked_update(const at::Tensor& x,
                     at::Tensor& sumsq_out,
                     at::Tensor& counts_out);
 
+// Sorted-run variant: caller pre-sorts cluster_ids and gathers x in the same
+// permutation. One atomicAdd per (run, feature) tuple instead of per token.
+void blocked_update_sorted(const at::Tensor& x_sorted,
+                           const at::Tensor& sorted_ids,
+                           at::Tensor& sums_out,
+                           at::Tensor& sumsq_out,
+                           at::Tensor& counts_out);
+
 // Forward-declare finalize so spherical.h is the single header for both ops;
 // finalize_spherical.cu (Plan 2 Task 5) provides the implementation.
 std::tuple<at::Tensor, at::Tensor, at::Tensor> finalize(
