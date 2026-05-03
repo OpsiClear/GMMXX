@@ -6,6 +6,7 @@
 #include "nb_torch.h"
 #include "canary/canary.h"
 #include "estep/spherical.h"
+#include "estep/diag.h"
 #include "mstep/spherical.h"
 #include "fused/spherical.h"
 
@@ -96,5 +97,20 @@ NB_MODULE(_C, m) {
         nb::arg("reg_covar"),
         "Fused spherical E/M single-tile kernel. Returns (means, var, weights, "
         "lse_per_sample, labels). Requires D <= 64, K <= 128.");
+
+    m.def("diag_assign", &gmmxx::estep::diag::assign,
+          nb::arg("x"), nb::arg("means"), nb::arg("var"), nb::arg("log_w"),
+          nb::arg("out") = nb::none(),
+          "Diagonal E-step assign. Returns int32 (B, N).");
+
+    m.def("diag_logsumexp", &gmmxx::estep::diag::logsumexp,
+          nb::arg("x"), nb::arg("means"), nb::arg("var"), nb::arg("log_w"),
+          nb::arg("out") = nb::none(),
+          "Diagonal E-step stable logsumexp. Returns fp32 (B, N).");
+
+    m.def("diag_resp", &gmmxx::estep::diag::resp,
+          nb::arg("x"), nb::arg("means"), nb::arg("var"), nb::arg("log_w"),
+          nb::arg("log_norm"), nb::arg("out") = nb::none(),
+          "Diagonal E-step responsibilities. Returns fp32 (B, N, K).");
 
 }

@@ -116,6 +116,8 @@ def _build_extension():
         str(CSRC / "estep" / "spherical_safe.cu"),
         str(CSRC / "estep" / "spherical_sm80.cu"),
         str(CSRC / "estep" / "spherical_dispatch.cu"),
+        str(CSRC / "estep" / "diag_safe.cu"),
+        str(CSRC / "estep" / "diag_dispatch.cu"),
         str(CSRC / "mstep" / "blocked_spherical.cu"),
         str(CSRC / "mstep" / "blocked_spherical_sorted.cu"),
         str(CSRC / "mstep" / "finalize_spherical.cu"),
