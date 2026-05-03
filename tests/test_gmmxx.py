@@ -840,3 +840,58 @@ def test_spherical_fit_each_backend(backend):
         f"expected last_backend_used_ to be {backend!r} or torch fallback, "
         f"got {gmm.last_backend_used_!r}"
     )
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton", "cuda"])
+def test_spherical_full_pipeline_each_backend(backend):
+    """End-to-end fit → predict → predict_proba → score_samples → score
+    under each backend, asserting shape correctness, normalized probability
+    rows, finite log-likelihoods, and predict-vs-argmax consistency."""
+    if not _backend_available(backend):
+        pytest.skip(f"backend {backend!r} not available")
+
+    import math
+
+    if backend == "torch":
+        device = "cpu"
+    else:
+        if not torch.cuda.is_available():
+            pytest.skip(f"backend {backend!r} requires CUDA")
+        device = "cuda"
+
+    torch.manual_seed(0)
+    x_train = torch.randn(2048, 16, device=device)
+    x_test = torch.randn(256, 16, device=device)
+
+    gmm = GMMXX(
+        n_components=6,
+        max_iter=15,
+        tol=1e-4,
+        random_state=0,
+        covariance_type="spherical",
+        backend=backend,
+    )
+    gmm.fit(x_train)
+
+    labels = gmm.predict(x_test)
+    proba = gmm.predict_proba(x_test)
+    ll = gmm.score_samples(x_test)
+    s = gmm.score(x_test)
+
+    assert labels.shape == (256,)
+    assert labels.dtype in (torch.long, torch.int32)
+    assert proba.shape == (256, 6)
+    assert torch.allclose(
+        proba.sum(-1), torch.ones(256, device=proba.device), atol=1e-3
+    )
+    assert ll.shape == (256,)
+    assert torch.isfinite(ll).all()
+    assert isinstance(s, float)
+    assert math.isfinite(s)
+    # Predict and predict_proba must agree on argmax (within fp32 tolerance).
+    agree = (labels.long() == proba.argmax(-1).long()).float().mean().item()
+    assert agree >= 0.99
+    # last_backend_used_ should be backend (or torch fallback if shape gate fails).
+    assert gmm.last_backend_used_ in {backend, "torch"}, (
+        f"expected last_backend_used_ in {{{backend!r}, 'torch'}}, got {gmm.last_backend_used_!r}"
+    )
