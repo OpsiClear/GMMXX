@@ -413,3 +413,153 @@ def fused_spherical(
         if _no_fallback():
             raise
         raise CudaRuntimeFallback(f"fused_spherical failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Tied kernels (Plan 7 — projected-coords approach)
+#
+# The tied E-step reuses the spherical CUDA kernels on projected coordinates:
+#   y = L⁻¹ x; ν_k = L⁻¹ μ_k; ||L⁻¹(x − μ_k)||² = ||y − ν_k||²
+# The shared log|L| term shifts the per-component log_w by a constant.
+# ---------------------------------------------------------------------------
+
+
+def tied_project(x: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
+    """Project x via L⁻¹ where L is lower-triangular. Returns same shape as x.
+
+    For (B, N, D) x and (B, D, D) L:
+      y[b, n, :] = L[b]⁻¹ x[b, n, :]
+    Implemented via batched solve_triangular: L @ Y^T = X^T → Y = (L⁻¹ X^T)^T.
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    L = _check_input(L, "L")
+    # solve_triangular wants RHS shape compatible with L's last two dims.
+    # x is (B, N, D); transpose to (B, D, N); solve L @ ?  = X^T → ? = L⁻¹ X^T.
+    x_t = x.transpose(-1, -2).contiguous()  # (B, D, N)
+    # Promote dtypes: solve_triangular requires both inputs to share dtype.
+    if x_t.dtype != L.dtype:
+        x_t = x_t.to(L.dtype)
+    y_t = torch.linalg.solve_triangular(L, x_t, upper=False)  # (B, D, N)
+    return y_t.transpose(-1, -2).contiguous()
+
+
+def tied_log_det(L: torch.Tensor) -> torch.Tensor:
+    """log|L| = Σ_d log L[b, d, d]. Returns (B,) fp32."""
+    diag = torch.diagonal(L, dim1=-2, dim2=-1)  # (B, D)
+    return diag.abs().log().sum(-1)
+
+
+def tied_assign(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    L: torch.Tensor,
+    log_w: torch.Tensor,
+) -> torch.Tensor:
+    """Tied E-step assign via spherical kernel on projected coordinates.
+
+    Returns int32 (B, N).
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    y = tied_project(x, L)
+    nu = tied_project(means, L)
+    B, K, D = nu.shape
+    var = torch.ones(B, K, dtype=torch.float32, device=x.device)
+    # The constant -log|L| - 0.5*D*log(2π*1) cancels under argmax across k,
+    # so we pass the unmodified log_w and var=1.
+    return spherical_assign(y, nu, var, log_w)
+
+
+def tied_logsumexp(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    L: torch.Tensor,
+    log_w: torch.Tensor,
+) -> torch.Tensor:
+    """Tied E-step logsumexp. Returns (B, N) fp32 — true tied log-likelihood per sample."""
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    y = tied_project(x, L)
+    nu = tied_project(means, L)
+    B, K, D = nu.shape
+    var = torch.ones(B, K, dtype=torch.float32, device=x.device)
+    # spherical_lse(y, ν, 1, log_w) = log Σ_k exp(log_w_k − 0.5·D·log(2π) − 0.5·||y−ν_k||²)
+    # tied_lse = log|L| extra subtracted because tied logit has -log|L| inside the exp:
+    # tied_lse = log Σ_k exp(log_w_k − log|L| − 0.5·D·log(2π) − 0.5·||y−ν_k||²)
+    #          = spherical_lse − log|L|
+    spherical_lse = spherical_logsumexp(y, nu, var, log_w)
+    log_det_L = tied_log_det(L).unsqueeze(-1)  # (B, 1)
+    return spherical_lse - log_det_L
+
+
+def tied_resp(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    L: torch.Tensor,
+    log_w: torch.Tensor,
+    log_norm: torch.Tensor,  # tied logsumexp output (with -log|L| applied)
+) -> torch.Tensor:
+    """Tied E-step responsibilities. Returns fp32 (B, N, K).
+
+    log_norm: pass tied_logsumexp output (which already accounts for log|L|).
+    Internally we shift back by +log|L| to use spherical_resp.
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    log_norm = _check_input(log_norm, "log_norm", dtype=torch.float32)
+    y = tied_project(x, L)
+    nu = tied_project(means, L)
+    B, K, D = nu.shape
+    var = torch.ones(B, K, dtype=torch.float32, device=x.device)
+    # spherical_resp computes exp(spherical_logit_k − spherical_log_norm).
+    # tied responsibilities: r_k = exp(tied_logit_k − tied_log_norm).
+    # Both tied_logit and tied_log_norm have -log|L| relative to spherical;
+    # the difference cancels. So we pass log_norm + log|L| as the spherical
+    # log_norm.
+    log_det_L = tied_log_det(L).unsqueeze(-1)  # (B, 1)
+    log_norm_for_spherical = log_norm + log_det_L
+    return spherical_resp(y, nu, var, log_w, log_norm_for_spherical)
+
+
+def tied_finalize(
+    sums: torch.Tensor,        # (B, K, D) — Σ_n r_{n,k} x_n  from blocked_update
+    xx_total: torch.Tensor,    # (B, D, D) — Σ_n x_n x_n^T (caller-supplied)
+    counts: torch.Tensor,      # (B, K) int32 OR fp32 (soft counts)
+    total_n: int,
+    reg_covar: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Tied finalize: divide sums, compute new Σ from X^T X − Σ_k n_k μ_k μ_k^T,
+    add reg_covar·I, Cholesky factor.
+
+    Returns (means_new (B, K, D), L_new (B, D, D), weights_new (B, K)).
+    """
+    require_cuda()
+    sums = _check_input(sums, "sums", dtype=torch.float32)
+    xx_total = _check_input(xx_total, "xx_total", dtype=torch.float32)
+    counts = _check_input(counts, "counts")  # accept int32 or fp32
+
+    B, K, D = sums.shape
+    counts_f = counts.float()
+    n_k = counts_f.clamp_min(1e-30)
+    means_new = sums / n_k.unsqueeze(-1)  # (B, K, D)
+    weights_new = counts_f / float(total_n)
+
+    # Σ_k n_k μ_k μ_k^T  =  (means * counts.unsqueeze(-1))^T @ means
+    weighted_means = means_new * counts_f.unsqueeze(-1)  # (B, K, D)
+    sigma_k_sum = weighted_means.transpose(-1, -2) @ means_new  # (B, D, D)
+
+    # Σ_new = (1/N) (X^T X − Σ_k n_k μ_k μ_k^T) + reg_covar I
+    sigma = (xx_total - sigma_k_sum) / float(total_n)
+    eye = torch.eye(D, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
+    sigma = sigma + reg_covar * eye
+    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))  # symmetrize
+
+    chol_new = torch.linalg.cholesky(sigma)  # (B, D, D)
+    return means_new, chol_new, weights_new
