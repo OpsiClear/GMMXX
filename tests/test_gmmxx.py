@@ -780,3 +780,63 @@ class GMMXXTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Plan 2: backend-parametrized spherical fit() smoke tests.
+# ---------------------------------------------------------------------------
+import pytest
+
+
+def _backend_available(backend: str) -> bool:
+    if backend == "torch":
+        return True
+    if backend == "cuda":
+        try:
+            from gmmxx._cuda import has_cuda
+            return has_cuda()
+        except ImportError:
+            return False
+    if backend == "triton":
+        try:
+            from gmmxx.assign_spherical_triton import spherical_assign_triton
+            return spherical_assign_triton is not None
+        except ImportError:
+            return False
+    return False
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton", "cuda"])
+def test_spherical_fit_each_backend(backend):
+    """End-to-end fit() with each backend, verifying shape, finite ELBO, and
+    the populated last_backend_used_ attribute."""
+    if not _backend_available(backend):
+        pytest.skip(f"backend {backend!r} not available")
+
+    import math
+
+    torch.manual_seed(0)
+    if backend == "torch":
+        device = "cpu"  # torch backend works on CPU; cuda/triton need GPU
+    else:
+        if not torch.cuda.is_available():
+            pytest.skip(f"backend {backend!r} requires CUDA")
+        device = "cuda"
+
+    x = torch.randn(2048, 16, device=device)
+    gmm = GMMXX(
+        n_components=8,
+        max_iter=20,
+        tol=1e-4,
+        random_state=0,
+        covariance_type="spherical",
+        backend=backend,
+    )
+    gmm.fit(x)
+    assert gmm.means_.shape == (8, 16)
+    assert gmm.weights_.shape == (8,)
+    assert math.isfinite(gmm.lower_bound_)
+    assert gmm.last_backend_used_ in {backend, "torch"}, (
+        f"expected last_backend_used_ to be {backend!r} or torch fallback, "
+        f"got {gmm.last_backend_used_!r}"
+    )
