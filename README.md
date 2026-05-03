@@ -62,7 +62,9 @@ The wheel contains the canonical `gmmxx` package. `third_party/` is reference co
 
 ### CUDA backend (experimental)
 
-`GMMXX` is migrating to a hand-written CUDA backend (Phase 1 in progress; see `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md`). The CUDA path is selected automatically on hosts with a working build:
+`GMMXX` is migrating to a hand-written CUDA backend. **Spherical covariance now runs on the CUDA path** (Plan 2 — safe SIMT kernels for fp32/fp16/bf16, `0 < D ≤ 128`, `0 < K ≤ 2048`). Diagonal, tied, and full are still on Triton/PyTorch — coming in Plans 6–8. See `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md` for the overall design and `docs/superpowers/plans/` for per-PR plans.
+
+The CUDA path is selected automatically on hosts with a working build:
 
 | Backend | Selected when |
 | --- | --- |
