@@ -72,12 +72,12 @@ def main():
     p.add_argument(
         "--gate",
         action="store_true",
-        help="Exit non-zero if CUDA > 1.5x Triton on any shape (Plan 3 threshold)",
+        help="Exit non-zero if CUDA > 1.1x Triton on any shape (Plan 4 threshold)",
     )
     p.add_argument(
         "--gate-threshold",
         type=float,
-        default=1.5,
+        default=1.1,
         help="Maximum acceptable cuda/triton ratio when --gate is set",
     )
     args = p.parse_args()
