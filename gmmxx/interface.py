@@ -430,6 +430,8 @@ class GMMXX:
             gmm_use_triton="auto" if self.use_triton else False,
             compute_labels=self.compute_labels_on_fit,
             approx_top_k=self.approx_top_k,
+            backend=self.backend,
+            legacy_no_triton=self._legacy_no_triton,
         )
         self._set_fit_result(
             labels_b=labels_b,
@@ -439,6 +441,14 @@ class GMMXX:
             info=info,
             batch_size=batch_size,
         )
+        # Set last_backend_used_ from backend_breakdown if available.
+        bd = info.get("backend_breakdown", {})
+        if bd.get("cuda", 0) > 0:
+            self.last_backend_used_ = "cuda"
+        elif bd.get("triton", 0) > 0:
+            self.last_backend_used_ = "triton"
+        else:
+            self.last_backend_used_ = "torch"
 
     def _train_spherical_cuda(self, x_b: torch.Tensor, batch_size: Optional[int]) -> None:
         """Spherical EM loop on the CUDA backend (Plan 2 safe path).
@@ -1103,6 +1113,8 @@ class GMMXX:
             "chunk_size_N": self.chunk_size_data,
             "chunk_size_K": self.chunk_size_centroids,
             "use_triton": self.use_triton,
+            "backend": self.backend,
+            "legacy_no_triton": self._legacy_no_triton,
         }
 
     def _use_triton_spherical_inference(self, x_b: torch.Tensor) -> bool:

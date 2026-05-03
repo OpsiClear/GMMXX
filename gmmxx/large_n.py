@@ -612,6 +612,7 @@ def batch_gmm_largeN_cpu(
     approx_top_k: Optional[int] = None,
     backend: str = "auto",
     legacy_no_triton: bool = False,
+    seed: int = 0,
 ) -> Tuple[Optional[torch.LongTensor], torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
     # Plan 10: backend dispatch.
     from . import _dispatch
@@ -633,7 +634,7 @@ def batch_gmm_largeN_cpu(
             dtype=dtype,
             device=device,
             chunk_size_data_cpu=chunk_size_N,
-            seed=0,
+            seed=seed,
             reg_covar=reg_covar,
             verbose=verbose,
         )
@@ -1469,6 +1470,8 @@ def large_n_predict_cpu(
     chunk_size_K: int,
     use_triton: bool = True,
     return_triton_used: bool = False,
+    backend: str = "auto",
+    legacy_no_triton: bool = False,
 ) -> torch.LongTensor | tuple[torch.LongTensor, bool]:
     _validate_large_n_input(x_cpu, device)
     _, n, d = x_cpu.shape
@@ -1593,6 +1596,8 @@ def large_n_score_samples_cpu(
     chunk_size_N: int,
     chunk_size_K: int,
     use_triton: bool = True,
+    backend: str = "auto",
+    legacy_no_triton: bool = False,
 ) -> torch.Tensor:
     _validate_large_n_input(x_cpu, device)
     _, n, d = x_cpu.shape
@@ -1728,6 +1733,8 @@ def large_n_predict_proba_cpu(
     chunk_size_N: int,
     chunk_size_K: int,
     use_triton: bool = True,
+    backend: str = "auto",
+    legacy_no_triton: bool = False,
 ) -> torch.Tensor:
     _validate_large_n_input(x_cpu, device)
     _, n, d = x_cpu.shape
