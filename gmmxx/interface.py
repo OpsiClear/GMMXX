@@ -483,7 +483,10 @@ class GMMXX:
             lb = float(lse.mean().item())
             lower_bound_history.append(lb)
 
-            sums, sumsq, counts = _cuda_mod.blocked_update_spherical(x_b, ids, K)
+            sums, sumsq, counts = _cuda_mod.blocked_update_spherical(
+                x_b, ids, K,
+                force_sort=getattr(self, "_force_sort", None),
+            )
             means, var, weights = _cuda_mod.finalize_spherical(
                 sums, sumsq, counts, means, var, N, self.reg_covar
             )
