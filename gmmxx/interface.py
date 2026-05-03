@@ -540,6 +540,80 @@ class GMMXX:
             batch_size=batch_size,
         )
 
+    def _train_diag_cuda(self, x_b: torch.Tensor, batch_size: Optional[int]) -> None:
+        """Diagonal-covariance EM loop on the CUDA backend.
+
+        Mirrors _train_spherical_cuda but with per-feature variance (B, K, D).
+        """
+        from . import _cuda as _cuda_mod
+
+        B, N, D = x_b.shape
+        K = self.k
+        device = x_b.device
+
+        # Initialize means by sampling from the data.
+        rng = torch.Generator(device=device).manual_seed(self.seed)
+        init_idx = torch.randint(0, N, (B, K), generator=rng, device=device)
+        means = torch.gather(
+            x_b, 1, init_idx.unsqueeze(-1).expand(-1, -1, D)
+        ).contiguous()
+
+        # Initialize variances per-feature: data variance per feature,
+        # broadcast to K. x_b.float().var(dim=1) is (B, D); expand to (B, K, D).
+        feat_var = x_b.float().var(dim=1).unsqueeze(1).expand(B, K, D).contiguous() / K
+        var = feat_var.clamp_min(self.reg_covar)
+        log_w = torch.full((B, K), -math.log(K), dtype=torch.float32, device=device)
+        weights = torch.full((B, K), 1.0 / K, dtype=torch.float32, device=device)
+
+        lower_bound_history: list[float] = []
+        n_iter = 0
+        prev_lb = -math.inf
+        lb = float("-inf")
+        ids: Optional[torch.Tensor] = None
+
+        for _ in range(self.niter):
+            n_iter += 1
+            ids = _cuda_mod.diag_assign(x_b, means, var, log_w)
+            lse = _cuda_mod.diag_logsumexp(x_b, means, var, log_w)
+            lb = float(lse.mean().item())
+            lower_bound_history.append(lb)
+
+            sums, sumsq, counts = _cuda_mod.blocked_update_diag(x_b, ids, K)
+            means, var, weights = _cuda_mod.finalize_diag(
+                sums, sumsq, counts, means, var, N, self.reg_covar
+            )
+            log_w = torch.log(weights.clamp_min(1e-30))
+
+            if abs(lb - prev_lb) < self.tol:
+                break
+            prev_lb = lb
+
+        labels_b = ids if (self.compute_labels_on_fit and ids is not None) else None
+        info = {
+            "lower_bound": lb,
+            "lower_bound_history": lower_bound_history,
+            "n_iter": n_iter,
+            "init_source": "cuda_random",
+            "triton_estep_enabled": False,
+            "triton_streaming_update_enabled": False,
+            "triton_fused_update_enabled": False,
+            "triton_approx_topk_enabled": False,
+            "triton_labels_enabled": False,
+            "approximate_em_enabled": False,
+            "approx_top_k": None,
+            "large_n_streaming_enabled": False,
+            "copy_stream_prefetch_enabled": False,
+            "backend_breakdown": {"cuda": n_iter},
+        }
+        self._set_fit_result(
+            labels_b=labels_b,
+            means_b=means,
+            variances_b=var,
+            weights_b=weights,
+            info=info,
+            batch_size=batch_size,
+        )
+
     def train(self, data: torch.Tensor):
         self._apply_matmul_precision()
         self._reset_fit_state()
@@ -602,6 +676,33 @@ class GMMXX:
                 approx_top_k=self.approx_top_k,
             )
         elif self.covariance_type == "diag":
+            # CUDA backend dispatch — when resolver picks "cuda", run the
+            # standalone EM loop in _train_diag_cuda and return early.
+            # The CUDA path does not implement approximate top-k EM, so
+            # when approx_top_k is requested we skip the CUDA dispatch and let
+            # the existing Triton/torch path handle it.
+            if self.approx_top_k is None:
+                from . import _dispatch
+                shape_for_dispatch = (
+                    x_b.shape[0],
+                    x_b.shape[1],
+                    x_b.shape[2],
+                    self.k,
+                )
+                resolved = _dispatch.resolve_backend_with_env(
+                    requested=self.backend,
+                    covariance="diag",
+                    shape=shape_for_dispatch,
+                    dtype=x_b.dtype,
+                    legacy_no_triton=self._legacy_no_triton,
+                )
+                if resolved == "cuda":
+                    self._train_diag_cuda(x_b, batch_size)
+                    self.last_backend_used_ = "cuda"
+                    self.cuda_estep_enabled_ = True
+                    return
+                self.last_backend_used_ = resolved
+
             labels_b, means_b, variances_b, weights_b, info = batch_gmm_Diagonal_torch_native(
                 x_b,
                 self.k,
