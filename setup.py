@@ -114,6 +114,7 @@ def _build_extension():
         str(CSRC / "bindings.cpp"),
         str(CSRC / "canary" / "canary.cu"),
         str(CSRC / "estep" / "spherical_safe.cu"),
+        str(CSRC / "mstep" / "blocked_spherical.cu"),
         str(nb_combined),
     ]
     include_dirs = [
@@ -121,6 +122,7 @@ def _build_extension():
         str(CSRC / "common"),
         str(CSRC / "canary"),
         str(CSRC / "estep"),
+        str(CSRC / "mstep"),
         nb_include,
         str(nb_robin_include),
     ]

@@ -6,6 +6,7 @@
 #include "nb_torch.h"
 #include "canary/canary.h"
 #include "estep/spherical.h"
+#include "mstep/spherical.h"
 
 namespace nb = nanobind;
 
@@ -49,4 +50,15 @@ NB_MODULE(_C, m) {
         nb::arg("log_norm"),
         nb::arg("out") = nb::none(),
         "Spherical E-step responsibilities r_{n,k}. Returns fp32 (B,N,K).");
+
+    m.def(
+        "blocked_update_spherical",
+        &gmmxx::mstep::spherical::blocked_update,
+        nb::arg("x"),
+        nb::arg("cluster_ids"),
+        nb::arg("sums_out"),
+        nb::arg("sumsq_out"),
+        nb::arg("counts_out"),
+        "Spherical M-step accumulator (per-token atomicAdd). Caller MUST zero "
+        "sums_out/sumsq_out/counts_out before calling.");
 }
