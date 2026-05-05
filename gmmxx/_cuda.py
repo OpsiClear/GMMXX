@@ -253,8 +253,10 @@ def soft_update_spherical(
                     - 0.5 * c_sq * inv_var                                  # (B,K)
             inner = cross - 0.5 * x_sq.unsqueeze(-1)                        # (B,N,K)
             logits = alpha.unsqueeze(1) + inner * inv_var.unsqueeze(1)      # (B,N,K)
+            # torch.softmax fuses max-shift + exp + normalize into one
+            # kernel pass; faster than logsumexp + (logits - lse).exp().
+            resp = torch.softmax(logits, dim=-1)
             lse = logits.logsumexp(dim=-1)
-            resp = (logits - lse.unsqueeze(-1)).exp()
         else:
             lse = spherical_logsumexp(x, means, var, log_w)
             resp = spherical_resp(x, means, var, log_w, lse)
