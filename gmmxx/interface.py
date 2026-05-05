@@ -525,6 +525,7 @@ class GMMXX:
         x_f_cached: Optional[torch.Tensor] = None
         x_sq_cached: Optional[torch.Tensor] = None
         x_aug_cached: Optional[torch.Tensor] = None
+        x_estep_aug_cached: Optional[torch.Tensor] = None
         if use_soft_update:
             x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
             x_sq_cached = x_f_cached.square().sum(dim=-1)
@@ -537,6 +538,13 @@ class GMMXX:
             )
             x_aug_cached = torch.cat(
                 [x_f_cached, x_sq_cached.unsqueeze(-1), ones_col], dim=-1
+            ).contiguous()
+            # E-step augmented input: (B, N, D+1) = [x_f | x_sq]. With
+            # appropriately-scaled means_aug (B, K, D+1) per iter, a single
+            # GEMM produces inv_var*(cross - 0.5*|x|^2), eliminating one
+            # (B,N,K) elementwise pass per iter.
+            x_estep_aug_cached = torch.cat(
+                [x_f_cached, x_sq_cached.unsqueeze(-1)], dim=-1
             ).contiguous()
 
         # Hoist hot-path attribute and module-attribute lookups out of
@@ -570,6 +578,7 @@ class GMMXX:
                     x_b, means, var, log_w, _reg_covar,
                     x_f_cached=x_f_cached, x_sq_cached=x_sq_cached,
                     x_aug_cached=x_aug_cached,
+                    x_estep_aug_cached=x_estep_aug_cached,
                     compute_ids=is_last,
                     compute_lse=_need_lse,
                 )

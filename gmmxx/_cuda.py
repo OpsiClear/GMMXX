@@ -215,6 +215,7 @@ def soft_update_spherical(
     x_f_cached: Optional[torch.Tensor] = None,
     x_sq_cached: Optional[torch.Tensor] = None,
     x_aug_cached: Optional[torch.Tensor] = None,
+    x_estep_aug_cached: Optional[torch.Tensor] = None,
     compute_ids: bool = True,
     compute_lse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -240,27 +241,34 @@ def soft_update_spherical(
         x_f = x_f_cached if x_f_cached is not None else x.float()
         x_sq = x_sq_cached if x_sq_cached is not None else x_f.square().sum(dim=-1)
         if _use_torch_fastpath_spherical(x):
-            # Inline cuBLAS GEMM + reductions. Rewrite the spherical logit
-            # to push as much as possible into per-cluster alpha (B,K),
-            # cutting the number of (B,N,K) elementwise ops nearly in half:
-            #   logit[n,k] = alpha[k] + inv_var[k] * (cross[n,k] - 0.5*|x_n|^2)
-            # where alpha[k] = log_w[k] - 0.5*D*log(2π*var[k]) - 0.5*|c_k|^2/var[k]
+            # Inline cuBLAS GEMM + reductions. Build the per-row+per-cluster
+            # logit via a SINGLE augmented GEMM:
+            #   logit[n,k] = alpha[k] + sum_d x_aug[n,d] * means_aug[k,d]
+            # where x_aug = [x | |x|^2] (B,N,D+1) is hoisted out of the
+            # EM loop, and means_aug[k,:] = inv_var[k]*[means[k,:] | -0.5]
+            # is computed per iter. This collapses cross-product, x_sq
+            # subtraction, and inv_var scaling into one GEMM.
             import math
             means_f = means.float()
-            cross = torch.matmul(x_f, means_f.transpose(-1, -2))           # (B,N,K)
             c_sq = (means_f * means_f).sum(-1)                              # (B,K)
             inv_var = 1.0 / var                                             # (B,K)
             alpha = log_w - 0.5 * float(D) * torch.log(2 * math.pi * var) \
                     - 0.5 * c_sq * inv_var                                  # (B,K)
-            inner = cross - 0.5 * x_sq.unsqueeze(-1)                        # (B,N,K)
-            logits = alpha.unsqueeze(1) + inner * inv_var.unsqueeze(1)      # (B,N,K)
-            # torch.softmax fuses max-shift + exp + normalize into one
-            # kernel pass; faster than logsumexp + (logits - lse).exp().
+            if x_estep_aug_cached is not None:
+                # means_aug[b,k,d] = inv_var[b,k] * means[b,k,d]  for d < D
+                # means_aug[b,k,D] = -0.5 * inv_var[b,k]
+                inv_var_kd = inv_var.unsqueeze(-1)                          # (B,K,1)
+                means_scaled = means_f * inv_var_kd                         # (B,K,D)
+                tail_col = -0.5 * inv_var.unsqueeze(-1)                     # (B,K,1)
+                means_aug = torch.cat([means_scaled, tail_col], dim=-1)     # (B,K,D+1)
+                logits = alpha.unsqueeze(1) + torch.matmul(
+                    x_estep_aug_cached, means_aug.transpose(-1, -2)
+                )                                                            # (B,N,K)
+            else:
+                cross = torch.matmul(x_f, means_f.transpose(-1, -2))       # (B,N,K)
+                inner = cross - 0.5 * x_sq.unsqueeze(-1)
+                logits = alpha.unsqueeze(1) + inner * inv_var.unsqueeze(1)
             resp = torch.softmax(logits, dim=-1)
-            # logsumexp is the single most expensive op (~100 us at fp32
-            # N=131k K=32 on Ampere). Only the caller's lower-bound report
-            # consumes lse, and that happens once per fit, so skip when
-            # not asked.
             lse = logits.logsumexp(dim=-1) if compute_lse else None
         else:
             lse = spherical_logsumexp(x, means, var, log_w)
