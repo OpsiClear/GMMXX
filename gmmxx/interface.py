@@ -549,6 +549,10 @@ class GMMXX:
         _soft_update = _cuda_mod.soft_update_spherical
         _fused = _cuda_mod.fused_spherical
         _approx = _cuda_mod.approx_topk_update_spherical
+        # When tol == 0 there's no early-termination check, so we don't
+        # need to materialize lb per iteration (.item() is a CUDA sync).
+        # Defer: we still compute lse on the GPU, just skip .item().
+        _skip_lb_per_iter = (_tol == 0)
         for it in range(_niter):
             n_iter += 1
             is_last = (it == _last_iter)
@@ -557,7 +561,7 @@ class GMMXX:
                     x_b, means, var, log_w, _reg_covar
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))
-                lb = float(lse.mean().item())
+                lb = float(lse.mean().item()) if not _skip_lb_per_iter or is_last else 0.0
             elif use_soft_update:
                 means, var, weights, lse, ids = _soft_update(
                     x_b, means, var, log_w, _reg_covar,
@@ -566,7 +570,7 @@ class GMMXX:
                     compute_ids=is_last,
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))
-                lb = float(lse.mean().item())
+                lb = float(lse.mean().item()) if not _skip_lb_per_iter or is_last else 0.0
             elif use_approx:
                 nk, sum_x, sum_x_sq, ll_sum = _cuda_mod.approx_topk_update_spherical(
                     x_b,
