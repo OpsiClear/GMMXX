@@ -235,14 +235,31 @@ def soft_update_spherical(
     log_w = _check_input(log_w, "log_w", dtype=torch.float32)
     try:
         B, N, D = x.shape
-        lse = spherical_logsumexp(x, means, var, log_w)
-        resp = spherical_resp(x, means, var, log_w, lse)
-        ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
         x_f = x_f_cached if x_f_cached is not None else x.float()
+        x_sq = x_sq_cached if x_sq_cached is not None else x_f.square().sum(dim=-1)
+        if _use_torch_fastpath_spherical(x):
+            # Inline cuBLAS GEMM + reductions to compute logits ONCE; the
+            # public spherical_logsumexp/_resp wrappers each rebuild the
+            # full logits tensor, doubling cuBLAS GEMM and bandwidth on
+            # the cached x_f / x_sq inputs.
+            import math
+            means_f = means.float()
+            cross = torch.matmul(x_f, means_f.transpose(-1, -2))           # (B,N,K)
+            c_sq = (means_f * means_f).sum(-1).unsqueeze(1)                 # (B,1,K)
+            dist = x_sq.unsqueeze(-1) + c_sq - 2.0 * cross
+            log_norm_const = 0.5 * float(D) * torch.log(
+                2 * math.pi * var
+            ).unsqueeze(1)
+            logits = log_w.unsqueeze(1) - log_norm_const - 0.5 * dist / var.unsqueeze(1)
+            lse = logits.logsumexp(dim=-1)
+            resp = (logits - lse.unsqueeze(-1)).exp()
+        else:
+            lse = spherical_logsumexp(x, means, var, log_w)
+            resp = spherical_resp(x, means, var, log_w, lse)
+        ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
         nk = resp.sum(dim=1)
         nk_safe = nk.clamp_min(1e-8)
         sum_x = torch.bmm(resp.transpose(1, 2), x_f)
-        x_sq = x_sq_cached if x_sq_cached is not None else x_f.square().sum(dim=-1)
         sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
         active_mask = nk > 1e-8
         means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x.dtype)
