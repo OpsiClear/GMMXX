@@ -260,32 +260,71 @@ def soft_update_spherical(
                 # Custom CUDA kernel fuses ~10 small (B,K) torch ops into
                 # a single launch: alpha + means_aug build.
                 alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
-                # B=1 fast path: torch.addmm fuses bias-add + GEMM into a
-                # single cuBLAS call (vs separate matmul + broadcast-add).
-                # When a bf16 copy of x_estep_aug is cached (D >= 64), use
-                # cuBLAS HMMA bf16 GEMM with fp32 accumulator/output —
-                # halves the input bandwidth on bandwidth-bound shapes.
-                if B == 1:
+                # Large-N L2-streaming path: chunk N so per-chunk
+                # logits + resp fit in L2 cache (~72 MB on Ada/Hopper).
+                # Avoids the full (B,N,K) DRAM round-trip on softmax->bmm.
+                # Threshold: chunk only when full (N*K) fp32 > 256 MB
+                # (i.e. wouldn't comfortably fit even in 72 MB L2).
+                K_dim = means_f.shape[1]
+                _N_total = x_estep_aug_cached.shape[1]
+                _full_resp_mb = _N_total * K_dim * 4 / (1024 * 1024)
+                _use_chunked = (
+                    B == 1 and x_aug_cached is not None
+                    and (not compute_lse) and (not compute_ids)
+                    and _full_resp_mb >= 256
+                )
+                if _use_chunked:
+                    # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
+                    chunk_size = 524288 if K_dim <= 32 else 262144
+                    Dp2 = x_aug_cached.shape[2]
+                    sum_aug_acc = torch.zeros(
+                        (B, K_dim, Dp2), dtype=torch.float32, device=x.device
+                    )
                     if x_estep_aug_bf16_cached is not None:
-                        # bf16 GEMM (HMMA) → bf16 output, then cast & bias-add.
-                        # Loses addmm fusion but halves matmul input BW; net
-                        # win for D >= 64 where the GEMM is BW-bound.
+                        means_aug_bf16 = means_aug[0].to(torch.bfloat16)
+                    for n_start in range(0, _N_total, chunk_size):
+                        n_end = min(n_start + chunk_size, _N_total)
+                        if x_estep_aug_bf16_cached is not None:
+                            cross_chunk = torch.mm(
+                                x_estep_aug_bf16_cached[0, n_start:n_end],
+                                means_aug_bf16.transpose(-1, -2),
+                            ).float()
+                            logits_chunk = (alpha[0] + cross_chunk).unsqueeze(0)
+                        else:
+                            logits_chunk = torch.addmm(
+                                alpha[0],
+                                x_estep_aug_cached[0, n_start:n_end],
+                                means_aug[0].transpose(-1, -2),
+                            ).unsqueeze(0)
+                        resp_chunk = torch.softmax(logits_chunk, dim=-1)
+                        sum_aug_acc.add_(torch.bmm(
+                            resp_chunk.transpose(1, 2),
+                            x_aug_cached[:, n_start:n_end],
+                        ))
+                    # Mark for downstream branch; resp / logits not materialized
+                    # globally in chunked mode.
+                    sum_aug = sum_aug_acc
+                    resp = None
+                    logits = None
+                    lse = None
+                elif B == 1:
+                    if x_estep_aug_bf16_cached is not None:
                         means_aug_bf16 = means_aug[0].to(torch.bfloat16)
                         cross = torch.mm(
                             x_estep_aug_bf16_cached[0],
                             means_aug_bf16.transpose(-1, -2),
-                        ).float()                                          # (N, K) fp32
+                        ).float()
                         logits = (alpha[0] + cross).unsqueeze(0)
                     else:
                         logits = torch.addmm(
-                            alpha[0],                                      # (K,)
-                            x_estep_aug_cached[0],                         # (N, D+1)
-                            means_aug[0].transpose(-1, -2),                # (D+1, K)
-                        ).unsqueeze(0)                                     # (1, N, K)
+                            alpha[0],
+                            x_estep_aug_cached[0],
+                            means_aug[0].transpose(-1, -2),
+                        ).unsqueeze(0)
                 else:
                     logits = alpha.unsqueeze(1) + torch.matmul(
                         x_estep_aug_cached, means_aug.transpose(-1, -2)
-                    )                                                        # (B,N,K)
+                    )
             else:
                 # Eager torch fallback (non-contig inputs / no aug cache).
                 c_sq = (means_f * means_f).sum(-1)
@@ -297,17 +336,24 @@ def soft_update_spherical(
                 cross = torch.matmul(x_f, means_f.transpose(-1, -2))
                 inner = cross - 0.5 * x_sq.unsqueeze(-1)
                 logits = alpha.unsqueeze(1) + inner * inv_var.unsqueeze(1)
-            resp = torch.softmax(logits, dim=-1)
-            lse = logits.logsumexp(dim=-1) if compute_lse else None
+            if logits is not None:
+                resp = torch.softmax(logits, dim=-1)
+                lse = logits.logsumexp(dim=-1) if compute_lse else None
+            # else: chunked path already produced sum_aug; resp / lse are None
         else:
             lse = spherical_logsumexp(x, means, var, log_w)
             resp = spherical_resp(x, means, var, log_w, lse)
             if not compute_lse:
                 lse = None
-        ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
-        if x_aug_cached is not None:
-            # Augmented bmm: x_aug is [x_f | |x|^2 | 1] (B,N,D+2). The cuBLAS
-            # GEMM produces sum_x, sum_x_sq, and nk in one shot, eliminating
+        ids = resp.argmax(dim=-1).to(torch.int32) if (resp is not None and compute_ids) else None
+        if x_aug_cached is not None and resp is None:
+            # Chunked-streaming mode already produced sum_aug above.
+            sum_x = sum_aug[..., :D]
+            sum_x_sq = sum_aug[..., D]
+            nk = sum_aug[..., D + 1]
+        elif x_aug_cached is not None and resp is not None:
+            # Augmented bmm: x_aug is [x_f | |x|^2 | 1] (B,N,D+2). cuBLAS
+            # produces sum_x, sum_x_sq, and nk in one shot, eliminating
             # both a (B,N,K) elementwise * + reduce and a (B,N,K) sum-reduce.
             sum_aug = torch.bmm(resp.transpose(1, 2), x_aug_cached)         # (B,K,D+2)
             sum_x = sum_aug[..., :D]
