@@ -563,14 +563,18 @@ class GMMXX:
                 log_w = torch.log(weights.clamp_min(1e-30))
                 lb = float(lse.mean().item()) if not _skip_lb_per_iter or is_last else 0.0
             elif use_soft_update:
+                # When tol=0 and not last iter, lb is unused so we can
+                # also skip the expensive logsumexp inside soft_update.
+                _need_lse = (not _skip_lb_per_iter) or is_last
                 means, var, weights, lse, ids = _soft_update(
                     x_b, means, var, log_w, _reg_covar,
                     x_f_cached=x_f_cached, x_sq_cached=x_sq_cached,
                     x_aug_cached=x_aug_cached,
                     compute_ids=is_last,
+                    compute_lse=_need_lse,
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))
-                lb = float(lse.mean().item()) if not _skip_lb_per_iter or is_last else 0.0
+                lb = float(lse.mean().item()) if _need_lse else 0.0
             elif use_approx:
                 nk, sum_x, sum_x_sq, ll_sum = _cuda_mod.approx_topk_update_spherical(
                     x_b,

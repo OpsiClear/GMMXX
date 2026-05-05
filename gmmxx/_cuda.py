@@ -216,7 +216,8 @@ def soft_update_spherical(
     x_sq_cached: Optional[torch.Tensor] = None,
     x_aug_cached: Optional[torch.Tensor] = None,
     compute_ids: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    compute_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Exact spherical soft-EM update using CUDA E-step kernels + torch reductions.
 
     This is the fallback for shapes where the single-tile fused kernel is
@@ -256,10 +257,16 @@ def soft_update_spherical(
             # torch.softmax fuses max-shift + exp + normalize into one
             # kernel pass; faster than logsumexp + (logits - lse).exp().
             resp = torch.softmax(logits, dim=-1)
-            lse = logits.logsumexp(dim=-1)
+            # logsumexp is the single most expensive op (~100 us at fp32
+            # N=131k K=32 on Ampere). Only the caller's lower-bound report
+            # consumes lse, and that happens once per fit, so skip when
+            # not asked.
+            lse = logits.logsumexp(dim=-1) if compute_lse else None
         else:
             lse = spherical_logsumexp(x, means, var, log_w)
             resp = spherical_resp(x, means, var, log_w, lse)
+            if not compute_lse:
+                lse = None
         ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
         if x_aug_cached is not None:
             # Augmented bmm: x_aug is [x_f | |x|^2 | 1] (B,N,D+2). The cuBLAS
