@@ -249,10 +249,15 @@ def soft_update_spherical(
             # is computed per iter. This collapses cross-product, x_sq
             # subtraction, and inv_var scaling into one GEMM.
             import math
-            means_f = means.float()
+            # In the fastpath x.dtype == fp32 (gated by
+            # _use_torch_fastpath_spherical), so means is also fp32 and
+            # the explicit .float() cast is a no-op kernel launch.
+            means_f = means
             c_sq = (means_f * means_f).sum(-1)                              # (B,K)
-            inv_var = 1.0 / var                                             # (B,K)
-            alpha = log_w - 0.5 * float(D) * torch.log(2 * math.pi * var) \
+            inv_var = var.reciprocal()                                      # (B,K)
+            half_d_log_2pi = 0.5 * float(D) * math.log(2 * math.pi)
+            alpha = (log_w - half_d_log_2pi) \
+                    - 0.5 * float(D) * torch.log(var) \
                     - 0.5 * c_sq * inv_var                                  # (B,K)
             if x_estep_aug_cached is not None:
                 # means_aug[b,k,d] = inv_var[b,k] * means[b,k,d]  for d < D
