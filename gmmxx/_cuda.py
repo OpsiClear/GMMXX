@@ -212,11 +212,17 @@ def soft_update_spherical(
     var: torch.Tensor,
     log_w: torch.Tensor,
     reg_covar: float,
+    x_f_cached: Optional[torch.Tensor] = None,
+    x_sq_cached: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exact spherical soft-EM update using CUDA E-step kernels + torch reductions.
 
     This is the fallback for shapes where the single-tile fused kernel is
     correct but slower. Returns (means, var, weights, lse_per_sample, labels).
+
+    x_f_cached / x_sq_cached are optional precomputed copies of x.float() and
+    x_f.square().sum(-1). Since x is constant across EM iterations, callers
+    can hoist these out of the loop to avoid redundant work.
     """
     require_cuda()
     x = _check_input(x, "x")
@@ -228,11 +234,11 @@ def soft_update_spherical(
         lse = spherical_logsumexp(x, means, var, log_w)
         resp = spherical_resp(x, means, var, log_w, lse)
         ids = resp.argmax(dim=-1).to(torch.int32)
-        x_f = x.float()
+        x_f = x_f_cached if x_f_cached is not None else x.float()
         nk = resp.sum(dim=1)
         nk_safe = nk.clamp_min(1e-8)
         sum_x = torch.bmm(resp.transpose(1, 2), x_f)
-        x_sq = x_f.square().sum(dim=-1)
+        x_sq = x_sq_cached if x_sq_cached is not None else x_f.square().sum(dim=-1)
         sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
         active_mask = nk > 1e-8
         means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x.dtype)
