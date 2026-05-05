@@ -635,8 +635,9 @@ class GMMXX:
 
             resp = _cuda_mod.diag_resp(x_b, means, var, log_w, lse)
             nk = resp.sum(dim=1)
-            sums = torch.bmm(resp.transpose(1, 2), x_b_f)
-            sumsq = (resp.unsqueeze(-1) * x_b_f.square().unsqueeze(2)).sum(dim=1)
+            resp_t = resp.transpose(1, 2)
+            sums = torch.bmm(resp_t, x_b_f)
+            sumsq = torch.bmm(resp_t, x_b_f.square())
 
             active_mask = nk > 1e-8
             nk_safe = nk.clamp_min(1e-8)
