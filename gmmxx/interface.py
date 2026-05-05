@@ -561,6 +561,10 @@ class GMMXX:
         # need to materialize lb per iteration (.item() is a CUDA sync).
         # Defer: we still compute lse on the GPU, just skip .item().
         _skip_lb_per_iter = (_tol == 0)
+        # The EM loop has no autograd — wrap to skip torch's grad-tracking
+        # bookkeeping on every op.
+        _grad_ctx = torch.no_grad()
+        _grad_ctx.__enter__()
         for it in range(_niter):
             n_iter += 1
             is_last = (it == _last_iter)
@@ -629,6 +633,7 @@ class GMMXX:
             if abs(lb - prev_lb) < _tol:
                 break
             prev_lb = lb
+        _grad_ctx.__exit__(None, None, None)
 
         if self.compute_labels_on_fit and ids is None:
             ids = _cuda_mod.spherical_assign(x_b, means, var, log_w)
