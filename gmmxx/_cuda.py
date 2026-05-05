@@ -266,9 +266,18 @@ def soft_update_spherical(
                 means_scaled = means_f * inv_var_kd                         # (B,K,D)
                 tail_col = -0.5 * inv_var.unsqueeze(-1)                     # (B,K,1)
                 means_aug = torch.cat([means_scaled, tail_col], dim=-1)     # (B,K,D+1)
-                logits = alpha.unsqueeze(1) + torch.matmul(
-                    x_estep_aug_cached, means_aug.transpose(-1, -2)
-                )                                                            # (B,N,K)
+                # B=1 fast path: torch.addmm fuses bias-add + GEMM into a
+                # single cuBLAS call (vs separate matmul + broadcast-add).
+                if B == 1:
+                    logits = torch.addmm(
+                        alpha[0],                                          # (K,)
+                        x_estep_aug_cached[0],                             # (N, D+1)
+                        means_aug[0].transpose(-1, -2),                    # (D+1, K)
+                    ).unsqueeze(0)                                         # (1, N, K)
+                else:
+                    logits = alpha.unsqueeze(1) + torch.matmul(
+                        x_estep_aug_cached, means_aug.transpose(-1, -2)
+                    )                                                        # (B,N,K)
             else:
                 cross = torch.matmul(x_f, means_f.transpose(-1, -2))       # (B,N,K)
                 inner = cross - 0.5 * x_sq.unsqueeze(-1)
