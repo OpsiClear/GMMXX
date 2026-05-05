@@ -108,6 +108,13 @@ def main():
         help="Semicolon-separated N,D,K,dtype quads",
     )
     p.add_argument(
+        "--shape-grid",
+        type=str,
+        default=None,
+        choices=[None, "small", "large", "xlarge"],
+        help="Preset shape grid: 'small' (default), 'large', 'xlarge'",
+    )
+    p.add_argument(
         "--gate",
         action="store_true",
         help="Exit non-zero if CUDA > 1.1x Triton on any shape (Plan 4 threshold)",
@@ -120,8 +127,15 @@ def main():
     )
     args = p.parse_args()
 
+    shape_presets = {
+        "small": "65536,32,64,fp16;65536,128,64,fp32;131072,16,32,fp16",
+        "large": "524288,32,64,fp16;524288,128,64,fp32;1048576,16,32,fp16",
+        "xlarge": "1048576,32,64,fp16;524288,128,64,fp32;4194304,16,32,fp16",
+    }
+    shapes_str = shape_presets.get(args.shape_grid, args.shapes)
+
     shapes = []
-    for s in args.shapes.split(";"):
+    for s in shapes_str.split(";"):
         n, d, k, dt = s.split(",")
         dt_t = {
             "fp16": torch.float16,
