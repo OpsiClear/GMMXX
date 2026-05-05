@@ -259,6 +259,115 @@ def finalize_spherical(
         raise CudaRuntimeFallback(f"finalize_spherical failed: {exc}") from exc
 
 
+def approx_topk_update_spherical(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    *,
+    top_k: int,
+    chunk_size_K: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Approximate spherical soft-EM update over each row's top-k components.
+
+    This is a torch-on-CUDA implementation of the existing approximate EM
+    contract. It stays on CUDA tensors, streams over K to avoid materializing
+    the full (B, N, K) logits tensor, and accumulates fp32 sufficient stats.
+
+    Returns (nk, sum_x, sum_x_sq, log_likelihood_sum).
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    var = _check_input(var, "var", dtype=torch.float32)
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    try:
+        import math
+
+        if x.ndim != 3:
+            raise ValueError("x must have shape (B, N, D)")
+        if means.ndim != 3:
+            raise ValueError("means must have shape (B, K, D)")
+        B, N, D = x.shape
+        Bm, K, Dm = means.shape
+        if (Bm, Dm) != (B, D):
+            raise ValueError("means shape mismatch")
+        if var.shape != (B, K):
+            raise ValueError("var shape mismatch")
+        if log_w.shape != (B, K):
+            raise ValueError("log_w shape mismatch")
+        top_k = int(top_k)
+        if top_k <= 0 or top_k >= K:
+            raise ValueError("top_k must be in [1, K - 1]")
+        chunk_size_K = int(chunk_size_K)
+        if chunk_size_K <= 0:
+            raise ValueError("chunk_size_K must be positive")
+
+        device = x.device
+        x_f = x.float()
+        means_f = means.float()
+        var_f = var.float().clamp_min(1e-30)
+        log_w_f = log_w.float()
+
+        x_sq = x_f.square().sum(dim=-1)  # (B, N)
+        best_logits = torch.full(
+            (B, N, top_k),
+            -torch.inf,
+            device=device,
+            dtype=torch.float32,
+        )
+        best_indices = torch.zeros(
+            (B, N, top_k),
+            device=device,
+            dtype=torch.long,
+        )
+        log_2pi = math.log(2.0 * math.pi)
+
+        for k_start in range(0, K, chunk_size_K):
+            k_end = min(k_start + chunk_size_K, K)
+            means_tile = means_f[:, k_start:k_end, :]  # (B, T, D)
+            var_tile = var_f[:, k_start:k_end]
+            log_w_tile = log_w_f[:, k_start:k_end]
+            means_sq = means_tile.square().sum(dim=-1)
+            cross = torch.bmm(x_f, means_tile.transpose(1, 2))
+            dist = (x_sq.unsqueeze(-1) + means_sq.unsqueeze(1) - 2.0 * cross).clamp_min(0.0)
+            logits = log_w_tile.unsqueeze(1) - 0.5 * (
+                dist / var_tile.unsqueeze(1)
+                + float(D) * (log_2pi + var_tile.log()).unsqueeze(1)
+            )
+            tile_k = k_end - k_start
+            tile_idx = torch.arange(k_start, k_end, device=device, dtype=torch.long)
+            tile_idx = tile_idx.view(1, 1, tile_k).expand(B, N, tile_k)
+            candidates = torch.cat((best_logits, logits), dim=-1)
+            candidate_idx = torch.cat((best_indices, tile_idx), dim=-1)
+            best_logits, positions = candidates.topk(top_k, dim=-1)
+            best_indices = candidate_idx.gather(-1, positions)
+
+        log_norm = best_logits.logsumexp(dim=-1)
+        resp = (best_logits - log_norm.unsqueeze(-1)).exp()
+
+        nk = torch.zeros((B, K), dtype=torch.float32, device=device)
+        sum_x = torch.zeros((B, K, D), dtype=torch.float32, device=device)
+        sum_x_sq = torch.zeros((B, K), dtype=torch.float32, device=device)
+
+        for local_idx in range(top_k):
+            idx = best_indices[:, :, local_idx]
+            r = resp[:, :, local_idx]
+            nk.scatter_add_(1, idx, r)
+            sum_x.scatter_add_(
+                1,
+                idx.unsqueeze(-1).expand(-1, -1, D),
+                r.unsqueeze(-1) * x_f,
+            )
+            sum_x_sq.scatter_add_(1, idx, r * x_sq)
+
+        return nk, sum_x, sum_x_sq, log_norm.sum()
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"approx_topk_update_spherical failed: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # Diagonal kernels (Plan 6 — safe path)
 # ---------------------------------------------------------------------------

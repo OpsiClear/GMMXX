@@ -913,7 +913,11 @@ def batch_gmm_largeN_cpu(
         dtype=dtype if dtype is not None else torch.float32,
         legacy_no_triton=legacy_no_triton,
     )
-    if resolved == "cuda" and covariance_type == "spherical":
+    if (
+        resolved == "cuda"
+        and covariance_type == "spherical"
+        and effective_approx_top_k is None
+    ):
         try:
             # x_cpu may be (B=1, N, D) — squeeze the batch dim for the helper.
             x_2d = x_cpu.squeeze(0) if x_cpu.ndim == 3 else x_cpu

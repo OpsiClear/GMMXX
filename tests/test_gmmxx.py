@@ -219,8 +219,8 @@ class GMMXXTests(unittest.TestCase):
             "approx_top_k": 8,
             "device": torch.device("cuda"),
         }
-        triton_model = GMMXX(use_triton=True, **common_kwargs).fit(x)
-        torch_model = GMMXX(use_triton=False, **common_kwargs).fit(x)
+        triton_model = GMMXX(backend="triton", **common_kwargs).fit(x)
+        torch_model = GMMXX(backend="torch", **common_kwargs).fit(x)
 
         self.assertTrue(triton_model.triton_approx_topk_enabled_)
         self.assertFalse(torch_model.triton_approx_topk_enabled_)

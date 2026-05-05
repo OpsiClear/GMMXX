@@ -19,6 +19,7 @@ blocked_update_spherical = _cuda.blocked_update_spherical
 blocked_update_spherical_sorted = _cuda.blocked_update_spherical_sorted
 finalize_spherical = _cuda.finalize_spherical
 fused_spherical = _cuda.fused_spherical
+approx_topk_update_spherical = _cuda.approx_topk_update_spherical
 
 # Diagonal (Plan 6).
 diag_assign = _cuda.diag_assign
@@ -58,6 +59,7 @@ __all__ = [
     "blocked_update_spherical_sorted",
     "finalize_spherical",
     "fused_spherical",
+    "approx_topk_update_spherical",
     "diag_assign",
     "diag_logsumexp",
     "diag_resp",

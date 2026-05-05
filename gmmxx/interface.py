@@ -49,6 +49,7 @@ from .torch_fallback import (
     full_assign_torch_native_chunked,
     full_predict_proba_torch_native_chunked,
     full_score_samples_torch_native_chunked,
+    _resolve_approx_top_k,
     spherical_assign_torch_native_chunked,
     spherical_predict_proba_torch_native_chunked,
     spherical_score_samples_torch_native_chunked,
@@ -459,10 +460,10 @@ class GMMXX:
           3. EM loop: assign -> blocked_update -> finalize -> check ELBO.
           4. Call _set_fit_result with the final tensors.
 
-        When cuda_spherical_fused_supported(D, K, dtype) is True (D <= 64,
-        K <= 128), each EM iteration uses the fused single-tile kernel which
-        combines logit computation, soft-EM responsibilities, per-cluster
-        accumulation, and finalization in one kernel pass instead of four.
+        When approx_top_k is set to a value in [1, K-1], each EM iteration
+        uses the CUDA approximate top-k soft-stat update. Otherwise, when
+        cuda_spherical_fused_supported(D, K, dtype) is True (D <= 64, K <=
+        128), each EM iteration uses the fused single-tile exact kernel.
         """
         from . import _cuda as _cuda_mod
         from . import _runtime as _gm_runtime
@@ -471,10 +472,17 @@ class GMMXX:
         K = self.k
         device = x_b.device
 
+        effective_approx_top_k = _resolve_approx_top_k(self.approx_top_k, K)
+        use_approx = effective_approx_top_k is not None
         # Decide once per fit() whether the fused path is available for this
-        # (D, K, dtype). The shape doesn't change across iterations.
-        use_fused = _gm_runtime.cuda_spherical_fused_supported(D, K, x_b.dtype)
+        # (D, K, dtype). Approx-topK is a separate soft-EM approximation and
+        # intentionally disables the exact fused path.
+        use_fused = (
+            not use_approx
+            and _gm_runtime.cuda_spherical_fused_supported(D, K, x_b.dtype)
+        )
         self.cuda_fused_update_enabled_ = bool(use_fused)
+        self.cuda_approx_topk_enabled_ = bool(use_approx)
 
         # Initialize means by sampling from the data.
         rng = torch.Generator(device=device).manual_seed(self.seed)
@@ -505,6 +513,33 @@ class GMMXX:
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))
                 lb = float(lse.mean().item())
+            elif use_approx:
+                nk, sum_x, sum_x_sq, ll_sum = _cuda_mod.approx_topk_update_spherical(
+                    x_b,
+                    means,
+                    var,
+                    log_w,
+                    top_k=int(effective_approx_top_k),
+                    chunk_size_K=self.chunk_size_centroids,
+                )
+                active_mask = nk > 1e-8
+                nk_safe = nk.clamp_min(1e-8)
+                means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x_b.dtype)
+                means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
+
+                mean_sq = means_new.float().square().sum(dim=-1)
+                var_new = (sum_x_sq - nk * mean_sq).clamp_min(0.0) / (
+                    nk_safe * float(D)
+                )
+                var_new = var_new.clamp_min(self.reg_covar)
+                var_new = torch.where(active_mask, var_new, var)
+
+                weights = (nk / float(N)).clamp_min(1e-8)
+                weights = weights / weights.sum(dim=-1, keepdim=True)
+                means, var = means_new, var_new
+                log_w = torch.log(weights.clamp_min(1e-30))
+                lb = float((ll_sum / float(B * N)).item())
+                ids = None
             else:
                 ids = _cuda_mod.spherical_assign(x_b, means, var, log_w)
                 lse = _cuda_mod.spherical_logsumexp(x_b, means, var, log_w)
@@ -524,7 +559,9 @@ class GMMXX:
                 break
             prev_lb = lb
 
-        labels_b = ids if (self.compute_labels_on_fit and ids is not None) else None
+        if self.compute_labels_on_fit and ids is None:
+            ids = _cuda_mod.spherical_assign(x_b, means, var, log_w)
+        labels_b = ids if self.compute_labels_on_fit else None
         info = {
             "lower_bound": lb,
             "lower_bound_history": lower_bound_history,
@@ -535,8 +572,9 @@ class GMMXX:
             "triton_fused_update_enabled": False,
             "triton_approx_topk_enabled": False,
             "triton_labels_enabled": False,
-            "approximate_em_enabled": False,
-            "approx_top_k": None,
+            "approximate_em_enabled": bool(use_approx),
+            "approx_top_k": effective_approx_top_k,
+            "cuda_approx_topk_enabled": bool(use_approx),
             "large_n_streaming_enabled": False,
             "copy_stream_prefetch_enabled": False,
             "backend_breakdown": {"cuda": n_iter},
@@ -799,30 +837,27 @@ class GMMXX:
         if self.covariance_type == "spherical":
             # CUDA backend dispatch — when resolver picks "cuda", run the
             # standalone EM loop in _train_spherical_cuda and return early.
-            # The CUDA path does not (yet) implement approximate top-k EM, so
-            # when approx_top_k is requested we skip the CUDA dispatch and let
-            # the existing Triton/torch path handle it.
-            if self.approx_top_k is None:
-                from . import _dispatch
-                shape_for_dispatch = (
-                    x_b.shape[0],
-                    x_b.shape[1],
-                    x_b.shape[2],
-                    self.k,
-                )
-                resolved = _dispatch.resolve_backend_with_env(
-                    requested=self.backend,
-                    covariance="spherical",
-                    shape=shape_for_dispatch,
-                    dtype=x_b.dtype,
-                    legacy_no_triton=self._legacy_no_triton,
-                )
-                if resolved == "cuda":
-                    self._train_spherical_cuda(x_b, batch_size)
-                    self.last_backend_used_ = "cuda"
-                    self.cuda_estep_enabled_ = True
-                    return
-                self.last_backend_used_ = resolved
+            # This path handles both exact EM and approximate top-k EM.
+            from . import _dispatch
+            shape_for_dispatch = (
+                x_b.shape[0],
+                x_b.shape[1],
+                x_b.shape[2],
+                self.k,
+            )
+            resolved = _dispatch.resolve_backend_with_env(
+                requested=self.backend,
+                covariance="spherical",
+                shape=shape_for_dispatch,
+                dtype=x_b.dtype,
+                legacy_no_triton=self._legacy_no_triton,
+            )
+            if resolved == "cuda":
+                self._train_spherical_cuda(x_b, batch_size)
+                self.last_backend_used_ = "cuda"
+                self.cuda_estep_enabled_ = True
+                return
+            self.last_backend_used_ = resolved
 
             labels_b, means_b, variances_b, weights_b, info = batch_gmm_Spherical_torch_native(
                 x_b,
