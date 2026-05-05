@@ -528,10 +528,15 @@ class GMMXX:
         if use_soft_update:
             x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
             x_sq_cached = x_f_cached.square().sum(dim=-1)
-            # Pre-concatenate x_f and x_sq into (B, N, D+1) once for the
-            # augmented bmm M-step path.
+            # Pre-concatenate x_f, x_sq, and ones into (B, N, D+2) once for
+            # the augmented bmm M-step path. The trailing ones column lets
+            # us read nk = sum(resp) from the same GEMM.
+            ones_col = torch.ones(
+                (x_f_cached.shape[0], x_f_cached.shape[1], 1),
+                dtype=torch.float32, device=x_f_cached.device,
+            )
             x_aug_cached = torch.cat(
-                [x_f_cached, x_sq_cached.unsqueeze(-1)], dim=-1
+                [x_f_cached, x_sq_cached.unsqueeze(-1), ones_col], dim=-1
             ).contiguous()
 
         # Hoist hot-path attribute and module-attribute lookups out of

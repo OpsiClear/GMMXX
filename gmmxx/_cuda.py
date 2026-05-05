@@ -259,18 +259,19 @@ def soft_update_spherical(
             lse = spherical_logsumexp(x, means, var, log_w)
             resp = spherical_resp(x, means, var, log_w, lse)
         ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
-        nk = resp.sum(dim=1)
-        nk_safe = nk.clamp_min(1e-8)
         if x_aug_cached is not None:
-            # Augmented bmm: x_aug is x_f with |x|^2 appended as last column.
-            # Computes sum_x and sum_x_sq in one cuBLAS GEMM, saving a
-            # separate (B,N,K) elementwise * + reduce pass.
-            sum_aug = torch.bmm(resp.transpose(1, 2), x_aug_cached)         # (B,K,D+1)
+            # Augmented bmm: x_aug is [x_f | |x|^2 | 1] (B,N,D+2). The cuBLAS
+            # GEMM produces sum_x, sum_x_sq, and nk in one shot, eliminating
+            # both a (B,N,K) elementwise * + reduce and a (B,N,K) sum-reduce.
+            sum_aug = torch.bmm(resp.transpose(1, 2), x_aug_cached)         # (B,K,D+2)
             sum_x = sum_aug[..., :D]
             sum_x_sq = sum_aug[..., D]
+            nk = sum_aug[..., D + 1]
         else:
+            nk = resp.sum(dim=1)
             sum_x = torch.bmm(resp.transpose(1, 2), x_f)
             sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
+        nk_safe = nk.clamp_min(1e-8)
         active_mask = nk > 1e-8
         means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x.dtype)
         means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
