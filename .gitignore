@@ -31,3 +31,5 @@ build_log*.txt
 
 # uv lockfile — not committed in this project; users regenerate on install.
 uv.lock
+bench_inner.py
+profile_soft.py

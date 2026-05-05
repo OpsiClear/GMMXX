@@ -518,18 +518,28 @@ class GMMXX:
             x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
             x_sq_cached = x_f_cached.square().sum(dim=-1)
 
-        for it in range(self.niter):
+        # Hoist hot-path attribute and module-attribute lookups out of
+        # the Python loop. The interpreter's name resolution per iter on
+        # small shapes (where each iter is < 1 ms) is non-trivial.
+        _niter = self.niter
+        _reg_covar = self.reg_covar
+        _tol = self.tol
+        _last_iter = _niter - 1
+        _soft_update = _cuda_mod.soft_update_spherical
+        _fused = _cuda_mod.fused_spherical
+        _approx = _cuda_mod.approx_topk_update_spherical
+        for it in range(_niter):
             n_iter += 1
-            is_last = (it == self.niter - 1)
+            is_last = (it == _last_iter)
             if use_fused:
-                means, var, weights, lse, ids = _cuda_mod.fused_spherical(
-                    x_b, means, var, log_w, self.reg_covar
+                means, var, weights, lse, ids = _fused(
+                    x_b, means, var, log_w, _reg_covar
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))
                 lb = float(lse.mean().item())
             elif use_soft_update:
-                means, var, weights, lse, ids = _cuda_mod.soft_update_spherical(
-                    x_b, means, var, log_w, self.reg_covar,
+                means, var, weights, lse, ids = _soft_update(
+                    x_b, means, var, log_w, _reg_covar,
                     x_f_cached=x_f_cached, x_sq_cached=x_sq_cached,
                     compute_ids=is_last,
                 )
@@ -577,7 +587,7 @@ class GMMXX:
                 log_w = torch.log(weights.clamp_min(1e-30))
 
             lower_bound_history.append(lb)
-            if abs(lb - prev_lb) < self.tol:
+            if abs(lb - prev_lb) < _tol:
                 break
             prev_lb = lb
 
