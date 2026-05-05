@@ -477,8 +477,12 @@ class GMMXX:
         # Decide once per fit() whether the fused path is available for this
         # (D, K, dtype). Approx-topK is a separate soft-EM approximation and
         # intentionally disables the exact fused path.
+        # Exp3: fused kernel is SIMT-only (no sm80 mma); for fp16/bf16 the
+        # separate sm80-mma E-step + soft M-step path beats fused-SIMT by
+        # leveraging tensor cores via cuBLAS / mma.sync.
         use_fused = (
             not use_approx
+            and x_b.dtype == torch.float32
             and _gm_runtime.cuda_spherical_fused_supported(D, K, x_b.dtype)
         )
         use_soft_update = not use_approx and not use_fused and D <= 128 and K <= 256
