@@ -1249,6 +1249,8 @@ def batch_gmm_largeN_cpu(
             chunk_size_K=chunk_size_K,
             use_triton=bool(labels_use_triton and not triton_failed),
             return_triton_used=True,
+            backend=backend,
+            legacy_no_triton=legacy_no_triton,
         )
         labels, labels_triton_used = labels_result
     else:
@@ -1457,6 +1459,132 @@ def _tied_projected_terms(
     )
 
 
+def _resolve_large_n_inference_backend(
+    *,
+    covariance_type: str,
+    d: int,
+    k: int,
+    dtype: torch.dtype,
+    backend: str,
+    legacy_no_triton: bool,
+    use_triton: bool,
+) -> str:
+    """Resolve the large-N inference backend for a representative chunk."""
+    from . import _dispatch
+
+    effective_legacy_no_triton = legacy_no_triton or (backend == "auto" and not use_triton)
+    resolved = _dispatch.resolve_backend_with_env(
+        requested=backend,
+        covariance=covariance_type,
+        shape=(1, 1, d, k),
+        dtype=dtype,
+        legacy_no_triton=effective_legacy_no_triton,
+    )
+    if resolved == "triton" and not use_triton:
+        return "torch"
+    return resolved
+
+
+def _dominant_backend(counts: dict[str, int]) -> str:
+    if not any(counts.values()):
+        return "torch"
+    return max(("cuda", "triton", "torch"), key=lambda name: (counts[name], name == "cuda", name == "triton"))
+
+
+def _cuda_inference_terms(
+    means: torch.Tensor,
+    variances: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    covariance_type: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare CUDA inference parameters once before the chunk loop.
+
+    Returns (means_on_device, variance_or_cholesky, log_weights).
+    """
+    means_d = means.to(device=device, dtype=dtype).contiguous()
+    weights_f = weights.to(device=device, dtype=torch.float32).contiguous()
+    log_w = torch.log(weights_f.clamp_min(1e-30))
+
+    if covariance_type in {"spherical", "diag"}:
+        var_or_L = variances.to(device=device, dtype=torch.float32).contiguous()
+    elif covariance_type == "tied":
+        cov = variances.to(device=device, dtype=torch.float32).contiguous()
+        var_or_L = torch.linalg.cholesky(cov).contiguous()
+    elif covariance_type == "full":
+        cov = variances.to(device=device, dtype=torch.float32).contiguous()
+        var_or_L, info = torch.linalg.cholesky_ex(cov)
+        if bool((info != 0).any().item()):
+            raise RuntimeError("full covariance Cholesky failed during CUDA large-N inference setup")
+        var_or_L = var_or_L.contiguous()
+    else:
+        raise ValueError("covariance_type must be 'spherical', 'diag', 'tied', or 'full'")
+    return means_d, var_or_L, log_w
+
+
+def _cuda_assign_chunk(
+    x_chunk: torch.Tensor,
+    terms: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    covariance_type: str,
+) -> torch.Tensor:
+    from . import _cuda as _cuda_mod
+
+    means, var_or_L, log_w = terms
+    if covariance_type == "spherical":
+        return _cuda_mod.spherical_assign(x_chunk, means, var_or_L, log_w)
+    if covariance_type == "diag":
+        return _cuda_mod.diag_assign(x_chunk, means, var_or_L, log_w)
+    if covariance_type == "tied":
+        return _cuda_mod.tied_assign(x_chunk, means, var_or_L, log_w)
+    if covariance_type == "full":
+        return _cuda_mod.full_assign(x_chunk, means, var_or_L, log_w)
+    raise ValueError("covariance_type must be 'spherical', 'diag', 'tied', or 'full'")
+
+
+def _cuda_logsumexp_chunk(
+    x_chunk: torch.Tensor,
+    terms: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    covariance_type: str,
+) -> torch.Tensor:
+    from . import _cuda as _cuda_mod
+
+    means, var_or_L, log_w = terms
+    if covariance_type == "spherical":
+        return _cuda_mod.spherical_logsumexp(x_chunk, means, var_or_L, log_w)
+    if covariance_type == "diag":
+        return _cuda_mod.diag_logsumexp(x_chunk, means, var_or_L, log_w)
+    if covariance_type == "tied":
+        return _cuda_mod.tied_logsumexp(x_chunk, means, var_or_L, log_w)
+    if covariance_type == "full":
+        return _cuda_mod.full_logsumexp(x_chunk, means, var_or_L, log_w)
+    raise ValueError("covariance_type must be 'spherical', 'diag', 'tied', or 'full'")
+
+
+def _cuda_resp_chunk(
+    x_chunk: torch.Tensor,
+    terms: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    log_norm: torch.Tensor,
+    *,
+    covariance_type: str,
+) -> torch.Tensor:
+    from . import _cuda as _cuda_mod
+
+    means, var_or_L, log_w = terms
+    if covariance_type == "spherical":
+        return _cuda_mod.spherical_resp(x_chunk, means, var_or_L, log_w, log_norm)
+    if covariance_type == "diag":
+        return _cuda_mod.diag_resp(x_chunk, means, var_or_L, log_w, log_norm)
+    if covariance_type == "tied":
+        return _cuda_mod.tied_resp(x_chunk, means, var_or_L, log_w, log_norm)
+    if covariance_type == "full":
+        return _cuda_mod.full_resp(x_chunk, means, var_or_L, log_w, log_norm)
+    raise ValueError("covariance_type must be 'spherical', 'diag', 'tied', or 'full'")
+
+
 def large_n_predict_cpu(
     x_cpu: torch.Tensor,
     means: torch.Tensor,
@@ -1470,15 +1598,42 @@ def large_n_predict_cpu(
     chunk_size_K: int,
     use_triton: bool = True,
     return_triton_used: bool = False,
+    return_backend_used: bool = False,
     backend: str = "auto",
     legacy_no_triton: bool = False,
-) -> torch.LongTensor | tuple[torch.LongTensor, bool]:
+) -> torch.LongTensor | tuple[torch.LongTensor, bool] | tuple[torch.LongTensor, str]:
     _validate_large_n_input(x_cpu, device)
     _, n, d = x_cpu.shape
     k = means.shape[1]
     labels = torch.empty((1, n), dtype=torch.long, device=x_cpu.device)
     triton_used = False
     triton_failed = False
+    backend_counts = {"cuda": 0, "triton": 0, "torch": 0}
+    resolved_backend = _resolve_large_n_inference_backend(
+        covariance_type=covariance_type,
+        d=d,
+        k=k,
+        dtype=dtype,
+        backend=backend,
+        legacy_no_triton=legacy_no_triton,
+        use_triton=use_triton,
+    )
+    cuda_enabled = resolved_backend == "cuda"
+    cuda_terms = None
+    cuda_mod = None
+    if cuda_enabled:
+        from . import _cuda as cuda_mod
+        try:
+            cuda_terms = _cuda_inference_terms(
+                means,
+                variances,
+                weights,
+                covariance_type=covariance_type,
+                device=device,
+                dtype=dtype,
+            )
+        except Exception:
+            cuda_enabled = False
     triton_enabled = _large_n_triton_inference_supported(
         covariance_type=covariance_type,
         d=d,
@@ -1487,7 +1642,7 @@ def large_n_predict_cpu(
         device=device,
         use_triton=use_triton,
         labels=True,
-    )
+    ) and resolved_backend == "triton"
     triton_terms = None
     if triton_enabled:
         try:
@@ -1513,6 +1668,19 @@ def large_n_predict_cpu(
         dtype=dtype,
         chunk_size_N=chunk_size_N,
     ):
+        if cuda_enabled:
+            try:
+                labels_chunk = _cuda_assign_chunk(
+                    x_chunk,
+                    cuda_terms,
+                    covariance_type=covariance_type,
+                )
+                labels[:, n_start:n_end] = labels_chunk.to(torch.long).cpu()
+                backend_counts["cuda"] += 1
+                continue
+            except cuda_mod.CudaRuntimeFallback:
+                cuda_enabled = False
+
         if triton_enabled:
             try:
                 if covariance_type == "spherical":
@@ -1546,9 +1714,10 @@ def large_n_predict_cpu(
                         mean_precision_mean,
                         logdet,
                         log_weights,
-                    )
+                )
                 labels[:, n_start:n_end] = labels_chunk.to(torch.long).cpu()
                 triton_used = True
+                backend_counts["triton"] += 1
                 continue
             except Exception:
                 triton_failed = True
@@ -1579,6 +1748,9 @@ def large_n_predict_cpu(
             best_logits = torch.where(update_mask, tile_logits, best_logits)
             best_labels = torch.where(update_mask, tile_labels + k_start, best_labels)
         labels[:, n_start:n_end] = best_labels.cpu()
+        backend_counts["torch"] += 1
+    if return_backend_used:
+        return labels, _dominant_backend(backend_counts)
     if return_triton_used:
         return labels, bool(triton_used and not triton_failed)
     return labels
@@ -1598,11 +1770,38 @@ def large_n_score_samples_cpu(
     use_triton: bool = True,
     backend: str = "auto",
     legacy_no_triton: bool = False,
-) -> torch.Tensor:
+    return_backend_used: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, str]:
     _validate_large_n_input(x_cpu, device)
     _, n, d = x_cpu.shape
     k = means.shape[1]
     scores = torch.empty((1, n), dtype=torch.float32, device=x_cpu.device)
+    backend_counts = {"cuda": 0, "triton": 0, "torch": 0}
+    resolved_backend = _resolve_large_n_inference_backend(
+        covariance_type=covariance_type,
+        d=d,
+        k=k,
+        dtype=dtype,
+        backend=backend,
+        legacy_no_triton=legacy_no_triton,
+        use_triton=use_triton,
+    )
+    cuda_enabled = resolved_backend == "cuda"
+    cuda_terms = None
+    cuda_mod = None
+    if cuda_enabled:
+        from . import _cuda as cuda_mod
+        try:
+            cuda_terms = _cuda_inference_terms(
+                means,
+                variances,
+                weights,
+                covariance_type=covariance_type,
+                device=device,
+                dtype=dtype,
+            )
+        except Exception:
+            cuda_enabled = False
     triton_enabled = _large_n_triton_inference_supported(
         covariance_type=covariance_type,
         d=d,
@@ -1610,7 +1809,7 @@ def large_n_score_samples_cpu(
         dtype=dtype,
         device=device,
         use_triton=use_triton,
-    )
+    ) and resolved_backend == "triton"
     triton_terms = None
     log_norm_buffer = None
     if triton_enabled:
@@ -1642,6 +1841,19 @@ def large_n_score_samples_cpu(
         dtype=dtype,
         chunk_size_N=chunk_size_N,
     ):
+        if cuda_enabled:
+            try:
+                log_norm = _cuda_logsumexp_chunk(
+                    x_chunk,
+                    cuda_terms,
+                    covariance_type=covariance_type,
+                )
+                scores[:, n_start:n_end] = log_norm.cpu()
+                backend_counts["cuda"] += 1
+                continue
+            except cuda_mod.CudaRuntimeFallback:
+                cuda_enabled = False
+
         if triton_enabled:
             try:
                 out = log_norm_buffer[:, : n_end - n_start]
@@ -1705,6 +1917,7 @@ def large_n_score_samples_cpu(
                     )
                     log_norm = log_norm - 0.5 * logdet.unsqueeze(-1)
                 scores[:, n_start:n_end] = log_norm.cpu()
+                backend_counts["triton"] += 1
                 continue
             except Exception:
                 triton_enabled = False
@@ -1718,6 +1931,9 @@ def large_n_score_samples_cpu(
             chunk_size_K=chunk_size_K,
         )
         scores[:, n_start:n_end] = log_norm.cpu()
+        backend_counts["torch"] += 1
+    if return_backend_used:
+        return scores, _dominant_backend(backend_counts)
     return scores
 
 
@@ -1735,11 +1951,38 @@ def large_n_predict_proba_cpu(
     use_triton: bool = True,
     backend: str = "auto",
     legacy_no_triton: bool = False,
-) -> torch.Tensor:
+    return_backend_used: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, str]:
     _validate_large_n_input(x_cpu, device)
     _, n, d = x_cpu.shape
     k = means.shape[1]
     probs = torch.empty((1, n, k), dtype=torch.float32, device=x_cpu.device)
+    backend_counts = {"cuda": 0, "triton": 0, "torch": 0}
+    resolved_backend = _resolve_large_n_inference_backend(
+        covariance_type=covariance_type,
+        d=d,
+        k=k,
+        dtype=dtype,
+        backend=backend,
+        legacy_no_triton=legacy_no_triton,
+        use_triton=use_triton,
+    )
+    cuda_enabled = resolved_backend == "cuda"
+    cuda_terms = None
+    cuda_mod = None
+    if cuda_enabled:
+        from . import _cuda as cuda_mod
+        try:
+            cuda_terms = _cuda_inference_terms(
+                means,
+                variances,
+                weights,
+                covariance_type=covariance_type,
+                device=device,
+                dtype=dtype,
+            )
+        except Exception:
+            cuda_enabled = False
     triton_enabled = _large_n_triton_inference_supported(
         covariance_type=covariance_type,
         d=d,
@@ -1747,7 +1990,7 @@ def large_n_predict_proba_cpu(
         dtype=dtype,
         device=device,
         use_triton=use_triton,
-    )
+    ) and resolved_backend == "triton"
     if covariance_type == "tied":
         triton_enabled = False
     triton_terms = None
@@ -1780,6 +2023,25 @@ def large_n_predict_proba_cpu(
         dtype=dtype,
         chunk_size_N=chunk_size_N,
     ):
+        if cuda_enabled:
+            try:
+                log_norm = _cuda_logsumexp_chunk(
+                    x_chunk,
+                    cuda_terms,
+                    covariance_type=covariance_type,
+                )
+                resp = _cuda_resp_chunk(
+                    x_chunk,
+                    cuda_terms,
+                    log_norm,
+                    covariance_type=covariance_type,
+                )
+                probs[:, n_start:n_end, :] = resp.cpu()
+                backend_counts["cuda"] += 1
+                continue
+            except cuda_mod.CudaRuntimeFallback:
+                cuda_enabled = False
+
         if triton_enabled:
             try:
                 rows = n_end - n_start
@@ -1888,6 +2150,7 @@ def large_n_predict_proba_cpu(
                         config=tied_config,
                     )
                 probs[:, n_start:n_end, :] = resp.cpu()
+                backend_counts["triton"] += 1
                 continue
             except Exception:
                 triton_enabled = False
@@ -1914,4 +2177,7 @@ def large_n_predict_proba_cpu(
             probs[:, n_start:n_end, k_start:k_end] = torch.exp(
                 logits - log_norm.unsqueeze(-1)
             ).cpu()
+        backend_counts["torch"] += 1
+    if return_backend_used:
+        return probs, _dominant_backend(backend_counts)
     return probs

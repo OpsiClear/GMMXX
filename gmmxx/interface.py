@@ -1236,13 +1236,15 @@ class GMMXX:
     def predict(self, data: torch.Tensor) -> torch.LongTensor:
         x_b, batch_size = self._prepare_predict_input(data)
         if self._is_large_cpu_stream_input(x_b):
-            labels_b = large_n_predict_cpu(
+            labels_b, backend_used = large_n_predict_cpu(
                 x_b,
                 self.means_b,
                 self.variances_b,
                 self.weights_b,
+                return_backend_used=True,
                 **self._large_cpu_predict_kwargs(x_b),
             )
+            self.last_backend_used_ = backend_used
             return labels_b.squeeze(0) if batch_size is None else labels_b
         if self.covariance_type == "diag":
             # CUDA branch (Plan 6 Task 8)
@@ -1450,13 +1452,15 @@ class GMMXX:
     def predict_proba(self, data: torch.Tensor) -> torch.Tensor:
         x_b, batch_size = self._prepare_predict_input(data)
         if self._is_large_cpu_stream_input(x_b):
-            probs_b = large_n_predict_proba_cpu(
+            probs_b, backend_used = large_n_predict_proba_cpu(
                 x_b,
                 self.means_b,
                 self.variances_b,
                 self.weights_b,
+                return_backend_used=True,
                 **self._large_cpu_predict_kwargs(x_b),
             )
+            self.last_backend_used_ = backend_used
             return probs_b.squeeze(0) if batch_size is None else probs_b
         if self.covariance_type == "diag":
             # CUDA branch (Plan 6 Task 8)
@@ -1741,13 +1745,15 @@ class GMMXX:
     def score_samples(self, data: torch.Tensor) -> torch.Tensor:
         x_b, batch_size = self._prepare_predict_input(data)
         if self._is_large_cpu_stream_input(x_b):
-            scores_b = large_n_score_samples_cpu(
+            scores_b, backend_used = large_n_score_samples_cpu(
                 x_b,
                 self.means_b,
                 self.variances_b,
                 self.weights_b,
+                return_backend_used=True,
                 **self._large_cpu_predict_kwargs(x_b),
             )
+            self.last_backend_used_ = backend_used
             return scores_b.squeeze(0) if batch_size is None else scores_b
         if self.covariance_type == "diag":
             # CUDA branch (Plan 6 Task 8)
