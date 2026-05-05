@@ -214,7 +214,8 @@ def soft_update_spherical(
     reg_covar: float,
     x_f_cached: Optional[torch.Tensor] = None,
     x_sq_cached: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    compute_ids: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Exact spherical soft-EM update using CUDA E-step kernels + torch reductions.
 
     This is the fallback for shapes where the single-tile fused kernel is
@@ -223,6 +224,9 @@ def soft_update_spherical(
     x_f_cached / x_sq_cached are optional precomputed copies of x.float() and
     x_f.square().sum(-1). Since x is constant across EM iterations, callers
     can hoist these out of the loop to avoid redundant work.
+
+    compute_ids=False skips the (B,N,K) argmax — useful for callers that
+    only need labels at the end of the EM loop. Returns ids=None then.
     """
     require_cuda()
     x = _check_input(x, "x")
@@ -233,7 +237,7 @@ def soft_update_spherical(
         B, N, D = x.shape
         lse = spherical_logsumexp(x, means, var, log_w)
         resp = spherical_resp(x, means, var, log_w, lse)
-        ids = resp.argmax(dim=-1).to(torch.int32)
+        ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
         x_f = x_f_cached if x_f_cached is not None else x.float()
         nk = resp.sum(dim=1)
         nk_safe = nk.clamp_min(1e-8)

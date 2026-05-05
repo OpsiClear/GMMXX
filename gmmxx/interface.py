@@ -518,8 +518,9 @@ class GMMXX:
             x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
             x_sq_cached = x_f_cached.square().sum(dim=-1)
 
-        for _ in range(self.niter):
+        for it in range(self.niter):
             n_iter += 1
+            is_last = (it == self.niter - 1)
             if use_fused:
                 means, var, weights, lse, ids = _cuda_mod.fused_spherical(
                     x_b, means, var, log_w, self.reg_covar
@@ -530,6 +531,7 @@ class GMMXX:
                 means, var, weights, lse, ids = _cuda_mod.soft_update_spherical(
                     x_b, means, var, log_w, self.reg_covar,
                     x_f_cached=x_f_cached, x_sq_cached=x_sq_cached,
+                    compute_ids=is_last,
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))
                 lb = float(lse.mean().item())
