@@ -96,6 +96,33 @@ def canary_add_offset(input: torch.Tensor, offset: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _spherical_logits_torch(x: torch.Tensor, means: torch.Tensor,
+                             var: torch.Tensor, log_w: torch.Tensor) -> torch.Tensor:
+    """Compute (B, N, K) spherical logits via cuBLAS GEMM. fp32 cuBLAS uses TF32
+    on Ampere+ — same arithmetic class as Triton's tl.dot(input_precision='tf32x3').
+    """
+    import math
+    B, N, D = x.shape
+    K = means.shape[1]
+    x_f = x.float()
+    means_f = means.float()
+    cross = torch.matmul(x_f, means_f.transpose(-1, -2))               # (B, N, K)
+    x_sq = (x_f * x_f).sum(-1, keepdim=True)                            # (B, N, 1)
+    c_sq = (means_f * means_f).sum(-1).unsqueeze(1)                     # (B, 1, K)
+    dist = x_sq + c_sq - 2.0 * cross                                    # (B, N, K)
+    log_norm_const = 0.5 * float(D) * torch.log(2 * math.pi * var).unsqueeze(1)  # (B, 1, K)
+    return log_w.unsqueeze(1) - log_norm_const - 0.5 * dist / var.unsqueeze(1)
+
+
+def _use_torch_fastpath_spherical(x: torch.Tensor) -> bool:
+    """True when the cuBLAS GEMM path is expected to beat the safe SIMT kernel.
+
+    Currently: fp32 inputs (no mma) for any D >= 16. fp16/bf16 already use the
+    sm80 mma kernel which is fast.
+    """
+    return x.dtype == torch.float32 and x.is_cuda and x.dim() == 3 and x.shape[-1] >= 16
+
+
 def spherical_assign(
     x: torch.Tensor,
     means: torch.Tensor,
@@ -109,6 +136,12 @@ def spherical_assign(
     means = _check_input(means, "means")
     var = _check_input(var, "var", dtype=torch.float32)
     log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    if _use_torch_fastpath_spherical(x):
+        ids = _spherical_logits_torch(x, means, var, log_w).argmax(-1).to(torch.int32)
+        if out is not None:
+            out.copy_(ids)
+            return out
+        return ids
     try:
         return _C.spherical_assign(x, means, var, log_w, out)
     except RuntimeError as exc:
@@ -130,6 +163,12 @@ def spherical_logsumexp(
     means = _check_input(means, "means")
     var = _check_input(var, "var", dtype=torch.float32)
     log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    if _use_torch_fastpath_spherical(x):
+        lse = _spherical_logits_torch(x, means, var, log_w).logsumexp(-1)
+        if out is not None:
+            out.copy_(lse)
+            return out
+        return lse
     try:
         return _C.spherical_logsumexp(x, means, var, log_w, out)
     except RuntimeError as exc:
@@ -153,6 +192,12 @@ def spherical_resp(
     var = _check_input(var, "var", dtype=torch.float32)
     log_w = _check_input(log_w, "log_w", dtype=torch.float32)
     log_norm = _check_input(log_norm, "log_norm", dtype=torch.float32)
+    if _use_torch_fastpath_spherical(x):
+        r = (_spherical_logits_torch(x, means, var, log_w) - log_norm.unsqueeze(-1)).exp()
+        if out is not None:
+            out.copy_(r)
+            return out
+        return r
     try:
         return _C.spherical_resp(x, means, var, log_w, log_norm, out)
     except RuntimeError as exc:
