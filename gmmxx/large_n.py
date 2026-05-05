@@ -190,6 +190,281 @@ def _largen_spherical_cuda(
     return cluster_ids.unsqueeze(0), means, var, weights, info
 
 
+def _largen_covariance_cuda(
+    x_cpu: torch.Tensor,
+    n_components: int,
+    *,
+    covariance_type: str,
+    max_iters: int = 100,
+    tol: float = 1e-4,
+    dtype: torch.dtype,
+    device: torch.device,
+    chunk_size_N: int = 32768,
+    chunk_size_K: int = 1024,
+    init_params: str = "kmeans",
+    reg_covar: float = 1e-6,
+    kmeans_init_iters: int = 10,
+    kmeans_init_tol: float = 1e-4,
+    kmeans_use_triton: bool = True,
+    verbose: bool = False,
+    max_init_samples: int = 65536,
+    min_weight: float = 1e-8,
+    compute_labels: bool = True,
+) -> Tuple[Optional[torch.LongTensor], torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+    """Large-N CUDA EM for diag/tied/full covariance.
+
+    Spherical has a historical helper above. This helper mirrors the in-memory
+    CUDA EM loops while streaming chunks from CPU and aggregating sufficient
+    statistics across chunks before each finalize step.
+    """
+    from . import _cuda as _cuda_mod
+
+    _validate_large_n_input(x_cpu, device)
+    if covariance_type not in {"diag", "tied", "full"}:
+        raise ValueError("covariance_type must be 'diag', 'tied', or 'full'")
+
+    _, n, d = x_cpu.shape
+    k = int(n_components)
+    means, variances, weights, init_source, init_sample_size = _initialize_from_sample(
+        x_cpu,
+        k,
+        covariance_type=covariance_type,
+        device=device,
+        dtype=dtype,
+        init_params=init_params,
+        reg_covar=reg_covar,
+        kmeans_init_iters=kmeans_init_iters,
+        kmeans_init_tol=kmeans_init_tol,
+        kmeans_use_triton=kmeans_use_triton,
+        verbose=verbose,
+        max_init_samples=max_init_samples,
+    )
+
+    if covariance_type == "tied":
+        L = torch.linalg.cholesky(variances.to(torch.float32)).contiguous()
+        xx_total = torch.zeros((1, d, d), dtype=torch.float32, device=device)
+        for _, _, x_chunk, _ in _iter_device_chunks(
+            x_cpu, device=device, dtype=dtype, chunk_size_N=chunk_size_N
+        ):
+            x_f = x_chunk.float()
+            xx_total += x_f.transpose(-1, -2) @ x_f
+        var = None
+    elif covariance_type == "full":
+        L, info = torch.linalg.cholesky_ex(variances.to(torch.float32))
+        if bool((info != 0).any().item()):
+            raise RuntimeError("full covariance initialization is not positive definite")
+        L = L.contiguous()
+        var = None
+    else:
+        var = variances.to(torch.float32).contiguous()
+        L = None
+        xx_total = None
+
+    weights = weights.to(device=device, dtype=torch.float32).contiguous()
+    weights = weights.clamp_min(min_weight)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    log_w = torch.log(weights.clamp_min(1e-30))
+
+    lower_bound_history: list[float] = []
+    prev_lb: Optional[float] = None
+    prefetch_used = False
+
+    for iteration in range(int(max_iters)):
+        sums_total = torch.zeros((1, k, d), dtype=torch.float32, device=device)
+        counts_total = torch.zeros((1, k), dtype=torch.float32, device=device)
+        if covariance_type == "diag":
+            sumsq_total = torch.zeros((1, k, d), dtype=torch.float32, device=device)
+        elif covariance_type == "full":
+            outer_total = torch.zeros((1, k, d, d), dtype=torch.float32, device=device)
+
+        lse_sum = 0.0
+        lse_count = 0
+
+        for _, _, x_chunk, chunk_prefetch_used in _iter_device_chunks(
+            x_cpu,
+            device=device,
+            dtype=dtype,
+            chunk_size_N=chunk_size_N,
+        ):
+            prefetch_used = prefetch_used or chunk_prefetch_used
+            x_f = x_chunk.float()
+            if covariance_type == "diag":
+                lse = _cuda_mod.diag_logsumexp(x_chunk, means, var, log_w)
+                resp = _cuda_mod.diag_resp(x_chunk, means, var, log_w, lse)
+                counts = resp.sum(dim=1)
+                sums = torch.bmm(resp.transpose(1, 2), x_f)
+                sumsq = torch.bmm(resp.transpose(1, 2), x_f.square())
+                sumsq_total += sumsq
+            elif covariance_type == "tied":
+                lse = _cuda_mod.tied_logsumexp(x_chunk, means, L, log_w)
+                resp = _cuda_mod.tied_resp(x_chunk, means, L, log_w, lse)
+                counts = resp.sum(dim=1)
+                sums = torch.bmm(resp.transpose(1, 2), x_f)
+            else:
+                lse = _cuda_mod.full_logsumexp(x_chunk, means, L, log_w)
+                resp = _cuda_mod.full_resp(x_chunk, means, L, log_w, lse)
+                counts = resp.sum(dim=1)
+                sums = torch.bmm(resp.transpose(1, 2), x_f)
+                outer_sums = torch.einsum("bnk,bnd,bne->bkde", resp, x_f, x_f)
+                outer_total += outer_sums
+
+            sums_total += sums
+            counts_total += counts
+            lse_sum += float(lse.sum().item())
+            lse_count += int(x_chunk.shape[1])
+
+        lb = lse_sum / max(lse_count, 1)
+        lower_bound_history.append(lb)
+
+        if covariance_type == "diag":
+            active = counts_total > min_weight
+            counts_safe = counts_total.clamp_min(min_weight)
+            means_new = (sums_total / counts_safe.unsqueeze(-1)).to(dtype)
+            means = torch.where(active.unsqueeze(-1), means_new, means)
+            second_moment = sumsq_total / counts_safe.unsqueeze(-1)
+            var_new = (second_moment - means.float().square()).clamp_min(reg_covar)
+            var = torch.where(active.unsqueeze(-1), var_new, var)
+            weights = counts_total / float(n)
+        elif covariance_type == "tied":
+            means, L, weights = _finalize_tied_large_n_cuda(
+                sums_total, xx_total, counts_total, means, L, n, reg_covar
+            )
+        else:
+            means, L, weights = _finalize_full_large_n_cuda(
+                sums_total, outer_total, counts_total, means, L, n, reg_covar, min_weight
+            )
+
+        weights = weights.clamp_min(min_weight)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        log_w = torch.log(weights.clamp_min(1e-30))
+
+        if prev_lb is not None and abs(lb - prev_lb) < tol:
+            break
+        prev_lb = lb
+
+    if covariance_type == "diag":
+        variances_out = var
+    elif covariance_type == "tied":
+        variances_out = L @ L.transpose(-1, -2)
+    else:
+        variances_out = L @ L.transpose(-1, -2)
+
+    labels = None
+    if compute_labels:
+        labels_chunks = []
+        for _, _, x_chunk, _ in _iter_device_chunks(
+            x_cpu,
+            device=device,
+            dtype=dtype,
+            chunk_size_N=chunk_size_N,
+        ):
+            if covariance_type == "diag":
+                ids = _cuda_mod.diag_assign(x_chunk, means, var, log_w)
+            elif covariance_type == "tied":
+                ids = _cuda_mod.tied_assign(x_chunk, means, L, log_w)
+            else:
+                ids = _cuda_mod.full_assign(x_chunk, means, L, log_w)
+            labels_chunks.append(ids.squeeze(0).cpu())
+        labels = torch.cat(labels_chunks, dim=0).unsqueeze(0)
+
+    n_iter = len(lower_bound_history)
+    info = {
+        "n_iter": n_iter,
+        "lower_bound": lower_bound_history[-1] if lower_bound_history else float("nan"),
+        "lower_bound_history": lower_bound_history,
+        "init_source": init_source,
+        "init_sample_size": init_sample_size,
+        "large_n_streaming_enabled": True,
+        "copy_stream_prefetch_enabled": bool(prefetch_used),
+        "triton_estep_enabled": False,
+        "triton_fused_update_enabled": False,
+        "triton_approx_topk_enabled": False,
+        "triton_streaming_update_enabled": False,
+        "triton_labels_enabled": False,
+        "approximate_em_enabled": False,
+        "approx_top_k": None,
+        "fallback_reason": None,
+        "backend_breakdown": {"cuda": n_iter},
+    }
+    return labels, means, variances_out, weights, info
+
+
+def _finalize_tied_large_n_cuda(
+    sums: torch.Tensor,
+    xx_total: torch.Tensor,
+    counts: torch.Tensor,
+    old_means: torch.Tensor,
+    old_L: torch.Tensor,
+    total_n: int,
+    reg_covar: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    counts_f = counts.float()
+    active = counts_f > 0
+    n_k = counts_f.clamp_min(1e-30)
+    means_new = sums / n_k.unsqueeze(-1)
+    means_new = torch.where(active.unsqueeze(-1), means_new, old_means.float())
+    weights_new = counts_f / float(total_n)
+
+    weighted_means = means_new * counts_f.unsqueeze(-1)
+    sigma_k_sum = weighted_means.transpose(-1, -2) @ means_new
+    sigma = (xx_total - sigma_k_sum) / float(total_n)
+    d = sigma.shape[-1]
+    eye = torch.eye(d, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
+    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+
+    L_new = None
+    for jitter in (reg_covar, max(reg_covar * 10.0, 1e-5), 1e-4, 1e-3):
+        candidate, info = torch.linalg.cholesky_ex(sigma + float(jitter) * eye)
+        if not bool((info != 0).any().item()):
+            L_new = candidate
+            break
+    if L_new is None:
+        L_new = old_L.float()
+
+    if old_means.dtype != torch.float32:
+        means_new = means_new.to(old_means.dtype)
+    if old_L.dtype != torch.float32:
+        L_new = L_new.to(old_L.dtype)
+    return means_new, L_new, weights_new
+
+
+def _finalize_full_large_n_cuda(
+    sums: torch.Tensor,
+    outer_sums: torch.Tensor,
+    counts: torch.Tensor,
+    old_means: torch.Tensor,
+    old_L: torch.Tensor,
+    total_n: int,
+    reg_covar: float,
+    min_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    counts_f = counts.float()
+    active = counts_f > min_weight
+    n_k = counts_f.clamp_min(min_weight)
+    means_new = sums / n_k.unsqueeze(-1)
+    sigma = outer_sums / n_k.unsqueeze(-1).unsqueeze(-1) - (
+        means_new.unsqueeze(-1) * means_new.unsqueeze(-2)
+    )
+    d = sigma.shape[-1]
+    eye = torch.eye(d, device=sigma.device, dtype=sigma.dtype).view(1, 1, d, d)
+    sigma = 0.5 * (sigma + sigma.transpose(-1, -2)) + reg_covar * eye
+    L_new, info = torch.linalg.cholesky_ex(sigma)
+    failed = (info != 0) | (~active)
+
+    if failed.any():
+        old_means_f = old_means.float()
+        old_L_f = old_L.float()
+        means_new = torch.where(failed.unsqueeze(-1), old_means_f, means_new)
+        L_new = torch.where(failed.unsqueeze(-1).unsqueeze(-1), old_L_f, L_new)
+
+    weights_new = counts_f / float(total_n)
+    if old_means.dtype != torch.float32:
+        means_new = means_new.to(old_means.dtype)
+    if old_L.dtype != torch.float32:
+        L_new = L_new.to(old_L.dtype)
+    return means_new, L_new, weights_new
+
+
 def _validate_large_n_input(x_cpu: torch.Tensor, device: torch.device) -> None:
     if x_cpu.ndim != 3:
         raise ValueError("x must have shape (B, N, D)")
@@ -614,31 +889,6 @@ def batch_gmm_largeN_cpu(
     legacy_no_triton: bool = False,
     seed: int = 0,
 ) -> Tuple[Optional[torch.LongTensor], torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
-    # Plan 10: backend dispatch.
-    from . import _dispatch
-    representative_shape = (1, 1024, x_cpu.shape[-1], int(n_components))
-    resolved = _dispatch.resolve_backend_with_env(
-        requested=backend,
-        covariance=covariance_type,
-        shape=representative_shape,
-        dtype=dtype if dtype is not None else torch.float32,
-        legacy_no_triton=legacy_no_triton,
-    )
-    if resolved == "cuda" and covariance_type == "spherical":
-        # x_cpu may be (B=1, N, D) — squeeze the batch dim for the helper.
-        x_2d = x_cpu.squeeze(0) if x_cpu.ndim == 3 else x_cpu
-        return _largen_spherical_cuda(
-            x_2d, n_components,
-            max_iters=max_iters,
-            tol=tol,
-            dtype=dtype,
-            device=device,
-            chunk_size_data_cpu=chunk_size_N,
-            seed=seed,
-            reg_covar=reg_covar,
-            verbose=verbose,
-        )
-
     _validate_large_n_input(x_cpu, device)
     if covariance_type not in {"spherical", "diag", "tied", "full"}:
         raise ValueError("covariance_type must be 'spherical', 'diag', 'tied', or 'full'")
@@ -651,6 +901,71 @@ def batch_gmm_largeN_cpu(
     if min_weight <= 0.0:
         raise ValueError("min_weight must be positive")
     effective_approx_top_k = _resolve_approx_top_k(approx_top_k, n_components)
+    cuda_fallback_reason = None
+
+    # Plan 10: backend dispatch.
+    from . import _dispatch
+    representative_shape = (1, 1024, x_cpu.shape[-1], int(n_components))
+    resolved = _dispatch.resolve_backend_with_env(
+        requested=backend,
+        covariance=covariance_type,
+        shape=representative_shape,
+        dtype=dtype if dtype is not None else torch.float32,
+        legacy_no_triton=legacy_no_triton,
+    )
+    if resolved == "cuda" and covariance_type == "spherical":
+        try:
+            # x_cpu may be (B=1, N, D) — squeeze the batch dim for the helper.
+            x_2d = x_cpu.squeeze(0) if x_cpu.ndim == 3 else x_cpu
+            return _largen_spherical_cuda(
+                x_2d, n_components,
+                max_iters=max_iters,
+                tol=tol,
+                dtype=dtype,
+                device=device,
+                chunk_size_data_cpu=chunk_size_N,
+                seed=seed,
+                reg_covar=reg_covar,
+                verbose=verbose,
+            )
+        except Exception as exc:
+            if backend == "cuda":
+                raise
+            cuda_fallback_reason = (
+                f"large-N spherical CUDA EM failed: {type(exc).__name__}: {exc}"
+            )
+    if (
+        resolved == "cuda"
+        and covariance_type in {"diag", "tied", "full"}
+        and effective_approx_top_k is None
+    ):
+        try:
+            return _largen_covariance_cuda(
+                x_cpu,
+                n_components,
+                covariance_type=covariance_type,
+                max_iters=max_iters,
+                tol=tol,
+                dtype=dtype,
+                device=device,
+                chunk_size_N=chunk_size_N,
+                chunk_size_K=chunk_size_K,
+                init_params=init_params,
+                reg_covar=reg_covar,
+                kmeans_init_iters=kmeans_init_iters,
+                kmeans_init_tol=kmeans_init_tol,
+                kmeans_use_triton=kmeans_use_triton,
+                verbose=verbose,
+                max_init_samples=max_init_samples,
+                min_weight=min_weight,
+                compute_labels=compute_labels,
+            )
+        except Exception as exc:
+            if backend == "cuda":
+                raise
+            cuda_fallback_reason = (
+                f"large-N {covariance_type} CUDA EM failed: {type(exc).__name__}: {exc}"
+            )
 
     _, n, d = x_cpu.shape
     means, variances, weights, init_source, init_sample_size = _initialize_from_sample(
@@ -691,7 +1006,7 @@ def batch_gmm_largeN_cpu(
     triton_approx_used = False
     triton_approx_failed = False
     prefetch_used = False
-    fallback_reason = None
+    fallback_reason = cuda_fallback_reason
     log_norm_buffer = None
     partial_buffers = None
     triton_blocks = (0, 0, 0)
