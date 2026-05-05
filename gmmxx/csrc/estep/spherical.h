@@ -78,4 +78,12 @@ at::Tensor resp_sm80(const at::Tensor& x,
                      const at::Tensor& log_norm,
                      c10::optional<at::Tensor> out);
 
+// Soft-EM E-step preparation: builds alpha (B,K) and means_aug (B,K,D+1)
+// for the augmented cuBLAS GEMM that produces logits in one matmul.
+// Replaces ~10 small (B,K) torch ops with a single kernel launch.
+std::tuple<at::Tensor, at::Tensor> prepare_estep(
+    const at::Tensor& log_w,
+    const at::Tensor& means,
+    const at::Tensor& var);
+
 }}}  // namespace gmmxx::estep::spherical

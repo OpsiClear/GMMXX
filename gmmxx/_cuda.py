@@ -253,19 +253,12 @@ def soft_update_spherical(
             # _use_torch_fastpath_spherical), so means is also fp32 and
             # the explicit .float() cast is a no-op kernel launch.
             means_f = means
-            c_sq = (means_f * means_f).sum(-1)                              # (B,K)
-            inv_var = var.reciprocal()                                      # (B,K)
-            half_d_log_2pi = 0.5 * float(D) * math.log(2 * math.pi)
-            alpha = (log_w - half_d_log_2pi) \
-                    - 0.5 * float(D) * torch.log(var) \
-                    - 0.5 * c_sq * inv_var                                  # (B,K)
-            if x_estep_aug_cached is not None:
-                # means_aug[b,k,d] = inv_var[b,k] * means[b,k,d]  for d < D
-                # means_aug[b,k,D] = -0.5 * inv_var[b,k]
-                inv_var_kd = inv_var.unsqueeze(-1)                          # (B,K,1)
-                means_scaled = means_f * inv_var_kd                         # (B,K,D)
-                tail_col = -0.5 * inv_var.unsqueeze(-1)                     # (B,K,1)
-                means_aug = torch.cat([means_scaled, tail_col], dim=-1)     # (B,K,D+1)
+            if (x_estep_aug_cached is not None
+                    and means_f.is_contiguous() and var.is_contiguous()
+                    and log_w.is_contiguous()):
+                # Custom CUDA kernel fuses ~10 small (B,K) torch ops into
+                # a single launch: alpha + means_aug build.
+                alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                 # B=1 fast path: torch.addmm fuses bias-add + GEMM into a
                 # single cuBLAS call (vs separate matmul + broadcast-add).
                 if B == 1:
@@ -279,7 +272,14 @@ def soft_update_spherical(
                         x_estep_aug_cached, means_aug.transpose(-1, -2)
                     )                                                        # (B,N,K)
             else:
-                cross = torch.matmul(x_f, means_f.transpose(-1, -2))       # (B,N,K)
+                # Eager torch fallback (non-contig inputs / no aug cache).
+                c_sq = (means_f * means_f).sum(-1)
+                inv_var = var.reciprocal()
+                half_d_log_2pi = 0.5 * float(D) * math.log(2 * math.pi)
+                alpha = (log_w - half_d_log_2pi) \
+                        - 0.5 * float(D) * torch.log(var) \
+                        - 0.5 * c_sq * inv_var
+                cross = torch.matmul(x_f, means_f.transpose(-1, -2))
                 inner = cross - 0.5 * x_sq.unsqueeze(-1)
                 logits = alpha.unsqueeze(1) + inner * inv_var.unsqueeze(1)
             resp = torch.softmax(logits, dim=-1)

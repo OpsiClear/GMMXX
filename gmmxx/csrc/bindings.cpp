@@ -55,6 +55,16 @@ NB_MODULE(_C, m) {
         "Spherical E-step responsibilities r_{n,k}. Returns fp32 (B,N,K).");
 
     m.def(
+        "prepare_spherical_estep",
+        &gmmxx::estep::spherical::prepare_estep,
+        nb::arg("log_w"),
+        nb::arg("means"),
+        nb::arg("var"),
+        "Soft-EM E-step prep: returns (alpha (B,K), means_aug (B,K,D+1)) "
+        "for the augmented cuBLAS GEMM. Single kernel; replaces ~10 small "
+        "torch ops in the soft-EM E-step prep block.");
+
+    m.def(
         "blocked_update_spherical",
         &gmmxx::mstep::spherical::blocked_update,
         nb::arg("x"),
