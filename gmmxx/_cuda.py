@@ -239,19 +239,20 @@ def soft_update_spherical(
         x_f = x_f_cached if x_f_cached is not None else x.float()
         x_sq = x_sq_cached if x_sq_cached is not None else x_f.square().sum(dim=-1)
         if _use_torch_fastpath_spherical(x):
-            # Inline cuBLAS GEMM + reductions to compute logits ONCE; the
-            # public spherical_logsumexp/_resp wrappers each rebuild the
-            # full logits tensor, doubling cuBLAS GEMM and bandwidth on
-            # the cached x_f / x_sq inputs.
+            # Inline cuBLAS GEMM + reductions. Rewrite the spherical logit
+            # to push as much as possible into per-cluster alpha (B,K),
+            # cutting the number of (B,N,K) elementwise ops nearly in half:
+            #   logit[n,k] = alpha[k] + inv_var[k] * (cross[n,k] - 0.5*|x_n|^2)
+            # where alpha[k] = log_w[k] - 0.5*D*log(2π*var[k]) - 0.5*|c_k|^2/var[k]
             import math
             means_f = means.float()
             cross = torch.matmul(x_f, means_f.transpose(-1, -2))           # (B,N,K)
-            c_sq = (means_f * means_f).sum(-1).unsqueeze(1)                 # (B,1,K)
-            dist = x_sq.unsqueeze(-1) + c_sq - 2.0 * cross
-            log_norm_const = 0.5 * float(D) * torch.log(
-                2 * math.pi * var
-            ).unsqueeze(1)
-            logits = log_w.unsqueeze(1) - log_norm_const - 0.5 * dist / var.unsqueeze(1)
+            c_sq = (means_f * means_f).sum(-1)                              # (B,K)
+            inv_var = 1.0 / var                                             # (B,K)
+            alpha = log_w - 0.5 * float(D) * torch.log(2 * math.pi * var) \
+                    - 0.5 * c_sq * inv_var                                  # (B,K)
+            inner = cross - 0.5 * x_sq.unsqueeze(-1)                        # (B,N,K)
+            logits = alpha.unsqueeze(1) + inner * inv_var.unsqueeze(1)      # (B,N,K)
             lse = logits.logsumexp(dim=-1)
             resp = (logits - lse.unsqueeze(-1)).exp()
         else:
