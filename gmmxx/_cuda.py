@@ -275,7 +275,10 @@ def soft_update_spherical(
                 )
                 if _use_chunked:
                     # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
-                    chunk_size = 524288 if K_dim <= 32 else 262144
+                    # Pick chunk so per-chunk (chunk*K*4) <= ~32 MB to fit in
+                    # L2 across softmax→bmm hop on Ada (72 MB L2).
+                    target_chunk_bytes = 32 * 1024 * 1024
+                    chunk_size = max(65536, target_chunk_bytes // (K_dim * 4))
                     Dp2 = x_aug_cached.shape[2]
                     sum_aug_acc = torch.zeros(
                         (B, K_dim, Dp2), dtype=torch.float32, device=x.device
