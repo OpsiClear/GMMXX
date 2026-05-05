@@ -112,4 +112,9 @@ def cuda_spherical_fused_supported(d: int, n_components: int, dtype) -> bool:
         return False
     if not (0 < n_components <= 128):
         return False
+    # Benchmark on RTX 4090 showed the fused single-tile kernel regresses badly
+    # at the max tile corner (D=64,K=128). Route that shape to the exact
+    # soft-update CUDA path until a native fused fix lands.
+    if d >= 64 and n_components >= 128:
+        return False
     return True

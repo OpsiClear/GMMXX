@@ -161,6 +161,52 @@ def spherical_resp(
         raise CudaRuntimeFallback(f"spherical_resp failed: {exc}") from exc
 
 
+def soft_update_spherical(
+    x: torch.Tensor,
+    means: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    reg_covar: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact spherical soft-EM update using CUDA E-step kernels + torch reductions.
+
+    This is the fallback for shapes where the single-tile fused kernel is
+    correct but slower. Returns (means, var, weights, lse_per_sample, labels).
+    """
+    require_cuda()
+    x = _check_input(x, "x")
+    means = _check_input(means, "means")
+    var = _check_input(var, "var", dtype=torch.float32)
+    log_w = _check_input(log_w, "log_w", dtype=torch.float32)
+    try:
+        B, N, D = x.shape
+        lse = spherical_logsumexp(x, means, var, log_w)
+        resp = spherical_resp(x, means, var, log_w, lse)
+        ids = resp.argmax(dim=-1).to(torch.int32)
+        x_f = x.float()
+        nk = resp.sum(dim=1)
+        nk_safe = nk.clamp_min(1e-8)
+        sum_x = torch.bmm(resp.transpose(1, 2), x_f)
+        x_sq = x_f.square().sum(dim=-1)
+        sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
+        active_mask = nk > 1e-8
+        means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x.dtype)
+        means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
+        mean_sq = means_new.float().square().sum(dim=-1)
+        var_new = (sum_x_sq - nk * mean_sq).clamp_min(0.0) / (
+            nk_safe * float(D)
+        )
+        var_new = var_new.clamp_min(float(reg_covar))
+        var_new = torch.where(active_mask, var_new, var)
+        weights = (nk / float(N)).clamp_min(1e-8)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return means_new, var_new, weights, lse, ids
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"soft_update_spherical failed: {exc}") from exc
+
+
 def blocked_update_spherical(
     x: torch.Tensor,
     cluster_ids: torch.Tensor,

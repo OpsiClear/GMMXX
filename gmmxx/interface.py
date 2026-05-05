@@ -481,6 +481,7 @@ class GMMXX:
             not use_approx
             and _gm_runtime.cuda_spherical_fused_supported(D, K, x_b.dtype)
         )
+        use_soft_update = not use_approx and not use_fused and D <= 128 and K <= 256
         self.cuda_fused_update_enabled_ = bool(use_fused)
         self.cuda_approx_topk_enabled_ = bool(use_approx)
 
@@ -509,6 +510,12 @@ class GMMXX:
             n_iter += 1
             if use_fused:
                 means, var, weights, lse, ids = _cuda_mod.fused_spherical(
+                    x_b, means, var, log_w, self.reg_covar
+                )
+                log_w = torch.log(weights.clamp_min(1e-30))
+                lb = float(lse.mean().item())
+            elif use_soft_update:
+                means, var, weights, lse, ids = _cuda_mod.soft_update_spherical(
                     x_b, means, var, log_w, self.reg_covar
                 )
                 log_w = torch.log(weights.clamp_min(1e-30))

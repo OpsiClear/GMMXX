@@ -15,6 +15,7 @@ canary_add_offset = _cuda.canary_add_offset
 spherical_assign = _cuda.spherical_assign
 spherical_logsumexp = _cuda.spherical_logsumexp
 spherical_resp = _cuda.spherical_resp
+soft_update_spherical = _cuda.soft_update_spherical
 blocked_update_spherical = _cuda.blocked_update_spherical
 blocked_update_spherical_sorted = _cuda.blocked_update_spherical_sorted
 finalize_spherical = _cuda.finalize_spherical
@@ -56,6 +57,7 @@ __all__ = [
     "spherical_assign",
     "spherical_logsumexp",
     "spherical_resp",
+    "soft_update_spherical",
     "blocked_update_spherical",
     "blocked_update_spherical_sorted",
     "finalize_spherical",
