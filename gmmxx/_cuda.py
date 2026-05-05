@@ -216,6 +216,7 @@ def soft_update_spherical(
     x_sq_cached: Optional[torch.Tensor] = None,
     x_aug_cached: Optional[torch.Tensor] = None,
     x_estep_aug_cached: Optional[torch.Tensor] = None,
+    x_estep_aug_bf16_cached: Optional[torch.Tensor] = None,
     compute_ids: bool = True,
     compute_lse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -261,12 +262,26 @@ def soft_update_spherical(
                 alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                 # B=1 fast path: torch.addmm fuses bias-add + GEMM into a
                 # single cuBLAS call (vs separate matmul + broadcast-add).
+                # When a bf16 copy of x_estep_aug is cached (D >= 64), use
+                # cuBLAS HMMA bf16 GEMM with fp32 accumulator/output —
+                # halves the input bandwidth on bandwidth-bound shapes.
                 if B == 1:
-                    logits = torch.addmm(
-                        alpha[0],                                          # (K,)
-                        x_estep_aug_cached[0],                             # (N, D+1)
-                        means_aug[0].transpose(-1, -2),                    # (D+1, K)
-                    ).unsqueeze(0)                                         # (1, N, K)
+                    if x_estep_aug_bf16_cached is not None:
+                        # bf16 GEMM (HMMA) → bf16 output, then cast & bias-add.
+                        # Loses addmm fusion but halves matmul input BW; net
+                        # win for D >= 64 where the GEMM is BW-bound.
+                        means_aug_bf16 = means_aug[0].to(torch.bfloat16)
+                        cross = torch.mm(
+                            x_estep_aug_bf16_cached[0],
+                            means_aug_bf16.transpose(-1, -2),
+                        ).float()                                          # (N, K) fp32
+                        logits = (alpha[0] + cross).unsqueeze(0)
+                    else:
+                        logits = torch.addmm(
+                            alpha[0],                                      # (K,)
+                            x_estep_aug_cached[0],                         # (N, D+1)
+                            means_aug[0].transpose(-1, -2),                # (D+1, K)
+                        ).unsqueeze(0)                                     # (1, N, K)
                 else:
                     logits = alpha.unsqueeze(1) + torch.matmul(
                         x_estep_aug_cached, means_aug.transpose(-1, -2)

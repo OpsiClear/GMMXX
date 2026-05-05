@@ -526,6 +526,7 @@ class GMMXX:
         x_sq_cached: Optional[torch.Tensor] = None
         x_aug_cached: Optional[torch.Tensor] = None
         x_estep_aug_cached: Optional[torch.Tensor] = None
+        x_estep_aug_bf16_cached: Optional[torch.Tensor] = None
         if use_soft_update:
             x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
             x_sq_cached = x_f_cached.square().sum(dim=-1)
@@ -546,6 +547,13 @@ class GMMXX:
             x_estep_aug_cached = torch.cat(
                 [x_f_cached, x_sq_cached.unsqueeze(-1)], dim=-1
             ).contiguous()
+            # For D >= 64, the E-step GEMM is bandwidth-bound at fp32. Pre-
+            # cast a bf16 copy; cuBLAS HMMA with fp32 accumulator halves
+            # the input BW and uses bf16 tensor cores (2x throughput vs TF32).
+            if D >= 64:
+                x_estep_aug_bf16_cached = (
+                    x_estep_aug_cached.to(torch.bfloat16).contiguous()
+                )
 
         # Hoist hot-path attribute and module-attribute lookups out of
         # the Python loop. The interpreter's name resolution per iter on
@@ -583,6 +591,7 @@ class GMMXX:
                     x_f_cached=x_f_cached, x_sq_cached=x_sq_cached,
                     x_aug_cached=x_aug_cached,
                     x_estep_aug_cached=x_estep_aug_cached,
+                    x_estep_aug_bf16_cached=x_estep_aug_bf16_cached,
                     compute_ids=is_last,
                     compute_lse=_need_lse,
                 )
