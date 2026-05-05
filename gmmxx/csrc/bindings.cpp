@@ -89,6 +89,18 @@ NB_MODULE(_C, m) {
         "Empty clusters preserve previous (means, var) and get weight 0.");
 
     m.def(
+        "finalize_spherical_soft",
+        &gmmxx::mstep::spherical::finalize_soft,
+        nb::arg("sums"),
+        nb::arg("sumsq"),
+        nb::arg("nk"),
+        nb::arg("total_n"),
+        nb::arg("reg_covar"),
+        "Soft-EM finalize. fp32 nk (fractional cluster mass). Returns "
+        "(means, var, weights, log_w). Single kernel; replaces ~12 small "
+        "torch ops in the spherical soft-EM finalize block.");
+
+    m.def(
         "spherical_fused",
         &gmmxx::fused::spherical::fused,
         nb::arg("x"),

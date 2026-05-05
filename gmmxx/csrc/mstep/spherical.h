@@ -39,4 +39,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> finalize(
     int64_t total_n,
     double reg_covar);
 
+// Soft-EM finalize: fp32 nk (fractional cluster mass) instead of int32 counts,
+// always-active (no empty-cluster preservation — soft EM keeps every cluster
+// non-empty given proper init). Returns (means, var, weights, log_w) — log_w
+// is also computed in-kernel to spare the caller a separate torch.log launch.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> finalize_soft(
+    const at::Tensor& sums,
+    const at::Tensor& sumsq,
+    const at::Tensor& nk,
+    int64_t total_n,
+    double reg_covar);
+
 }}}  // namespace gmmxx::mstep::spherical

@@ -302,28 +302,32 @@ def soft_update_spherical(
             nk = resp.sum(dim=1)
             sum_x = torch.bmm(resp.transpose(1, 2), x_f)
             sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
-        # Finalize. Combine ops where possible to minimize kernel launches.
-        nk_safe = nk.clamp_min(1e-8)
-        active_mask = nk > 1e-8
-        # means_new dtype: same as x in this path (sum_x is fp32, x is fp32).
-        # Skip the explicit .to(x.dtype) cast.
-        same_dtype = (sum_x.dtype == x.dtype)
-        means_new = sum_x / nk_safe.unsqueeze(-1)
-        if not same_dtype:
-            means_new = means_new.to(x.dtype)
-        means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
-        # mean_sq from means_new: sum_x is fp32 already. .float() is no-op.
-        mean_sq = means_new.square().sum(dim=-1) if means_new.dtype == torch.float32 \
-                  else means_new.float().square().sum(dim=-1)
-        # Fold the .clamp_min(0.0) → .clamp_min(reg_covar) since reg_covar > 0.
-        var_new = ((sum_x_sq - nk * mean_sq) / (nk_safe * float(D))) \
-                    .clamp_min(float(reg_covar))
-        var_new = torch.where(active_mask, var_new, var)
-        # weights = nk / N (sum_k nk = N exactly for soft EM; explicit
-        # renormalization is a no-op except in the rare clamp_min case
-        # where empty clusters get a 1e-8 floor — and that adjustment is
-        # numerically negligible).
-        weights = (nk / float(N)).clamp_min(1e-8)
+        # Finalize. When inputs are fp32 (the cuBLAS fastpath), use the
+        # custom CUDA kernel `finalize_spherical_soft` which fuses the
+        # ~12 small (B,K) torch ops into a single launch. Otherwise fall
+        # back to the eager torch path (handles dtype conversion).
+        if sum_x.dtype == torch.float32 and x.dtype == torch.float32 \
+                and means.is_contiguous() and var.is_contiguous():
+            sum_x_c = sum_x.contiguous()
+            sum_x_sq_c = sum_x_sq.contiguous()
+            nk_c = nk.contiguous()
+            means_new, var_new, weights, _log_w_unused = _C.finalize_spherical_soft(
+                sum_x_c, sum_x_sq_c, nk_c, int(N), float(reg_covar),
+            )
+        else:
+            nk_safe = nk.clamp_min(1e-8)
+            active_mask = nk > 1e-8
+            same_dtype = (sum_x.dtype == x.dtype)
+            means_new = sum_x / nk_safe.unsqueeze(-1)
+            if not same_dtype:
+                means_new = means_new.to(x.dtype)
+            means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
+            mean_sq = means_new.square().sum(dim=-1) if means_new.dtype == torch.float32 \
+                      else means_new.float().square().sum(dim=-1)
+            var_new = ((sum_x_sq - nk * mean_sq) / (nk_safe * float(D))) \
+                        .clamp_min(float(reg_covar))
+            var_new = torch.where(active_mask, var_new, var)
+            weights = (nk / float(N)).clamp_min(1e-8)
         return means_new, var_new, weights, lse, ids
     except RuntimeError as exc:
         if _no_fallback():
