@@ -214,6 +214,7 @@ def soft_update_spherical(
     reg_covar: float,
     x_f_cached: Optional[torch.Tensor] = None,
     x_sq_cached: Optional[torch.Tensor] = None,
+    x_aug_cached: Optional[torch.Tensor] = None,
     compute_ids: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Exact spherical soft-EM update using CUDA E-step kernels + torch reductions.
@@ -259,8 +260,16 @@ def soft_update_spherical(
         ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
         nk = resp.sum(dim=1)
         nk_safe = nk.clamp_min(1e-8)
-        sum_x = torch.bmm(resp.transpose(1, 2), x_f)
-        sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
+        if x_aug_cached is not None:
+            # Augmented bmm: x_aug is x_f with |x|^2 appended as last column.
+            # Computes sum_x and sum_x_sq in one cuBLAS GEMM, saving a
+            # separate (B,N,K) elementwise * + reduce pass.
+            sum_aug = torch.bmm(resp.transpose(1, 2), x_aug_cached)         # (B,K,D+1)
+            sum_x = sum_aug[..., :D]
+            sum_x_sq = sum_aug[..., D]
+        else:
+            sum_x = torch.bmm(resp.transpose(1, 2), x_f)
+            sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
         active_mask = nk > 1e-8
         means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x.dtype)
         means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
