@@ -263,15 +263,16 @@ def soft_update_spherical(
                 # Large-N L2-streaming path: chunk N so per-chunk
                 # logits + resp fit in L2 cache (~72 MB on Ada/Hopper).
                 # Avoids the full (B,N,K) DRAM round-trip on softmax->bmm.
-                # Threshold: chunk only when full (N*K) fp32 > 256 MB
-                # (i.e. wouldn't comfortably fit even in 72 MB L2).
+                # Threshold: chunk when full (N*K) fp32 > 64 MB. The 72 MB
+                # L2 on Ada can hold smaller chunks across the softmax->bmm
+                # hop; chunking below ~64 MB is mostly launch overhead.
                 K_dim = means_f.shape[1]
                 _N_total = x_estep_aug_cached.shape[1]
                 _full_resp_mb = _N_total * K_dim * 4 / (1024 * 1024)
                 _use_chunked = (
                     B == 1 and x_aug_cached is not None
                     and (not compute_lse) and (not compute_ids)
-                    and _full_resp_mb >= 256
+                    and _full_resp_mb >= 64
                 )
                 if _use_chunked:
                     # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
