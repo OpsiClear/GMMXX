@@ -586,7 +586,9 @@ class GMMXX:
                     compute_ids=is_last,
                     compute_lse=_need_lse,
                 )
-                log_w = torch.log(weights.clamp_min(1e-30))
+                # weights already passed through .clamp_min(1e-8) inside
+                # soft_update; the second floor at 1e-30 is redundant.
+                log_w = torch.log(weights)
                 lb = float(lse.mean().item()) if _need_lse else 0.0
             elif use_approx:
                 nk, sum_x, sum_x_sq, ll_sum = _cuda_mod.approx_topk_update_spherical(
