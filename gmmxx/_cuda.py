@@ -305,8 +305,11 @@ def soft_update_spherical(
         var_new = ((sum_x_sq - nk * mean_sq) / (nk_safe * float(D))) \
                     .clamp_min(float(reg_covar))
         var_new = torch.where(active_mask, var_new, var)
+        # weights = nk / N (sum_k nk = N exactly for soft EM; explicit
+        # renormalization is a no-op except in the rare clamp_min case
+        # where empty clusters get a 1e-8 floor — and that adjustment is
+        # numerically negligible).
         weights = (nk / float(N)).clamp_min(1e-8)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
         return means_new, var_new, weights, lse, ids
     except RuntimeError as exc:
         if _no_fallback():
