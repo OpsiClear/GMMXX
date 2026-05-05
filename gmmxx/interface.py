@@ -612,6 +612,7 @@ class GMMXX:
         var = feat_var.clamp_min(self.reg_covar)
         log_w = torch.full((B, K), -math.log(K), dtype=torch.float32, device=device)
         weights = torch.full((B, K), 1.0 / K, dtype=torch.float32, device=device)
+        x_b_f = x_b.float()
 
         lower_bound_history: list[float] = []
         n_iter = 0
@@ -621,22 +622,36 @@ class GMMXX:
 
         for _ in range(self.niter):
             n_iter += 1
-            ids = _cuda_mod.diag_assign(x_b, means, var, log_w)
             lse = _cuda_mod.diag_logsumexp(x_b, means, var, log_w)
             lb = float(lse.mean().item())
             lower_bound_history.append(lb)
 
-            sums, sumsq, counts = _cuda_mod.blocked_update_diag(x_b, ids, K)
-            means, var, weights = _cuda_mod.finalize_diag(
-                sums, sumsq, counts, means, var, N, self.reg_covar
+            resp = _cuda_mod.diag_resp(x_b, means, var, log_w, lse)
+            nk = resp.sum(dim=1)
+            sums = torch.bmm(resp.transpose(1, 2), x_b_f)
+            sumsq = (resp.unsqueeze(-1) * x_b_f.square().unsqueeze(2)).sum(dim=1)
+
+            active_mask = nk > 1e-8
+            nk_safe = nk.clamp_min(1e-8)
+            means_new = (sums / nk_safe.unsqueeze(-1)).to(x_b.dtype)
+            means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
+            var_new = (sumsq / nk_safe.unsqueeze(-1) - means_new.float().square()).clamp_min(
+                self.reg_covar
             )
+            var_new = torch.where(active_mask.unsqueeze(-1), var_new, var)
+
+            weights = (nk / float(N)).clamp_min(1e-8)
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+            means, var = means_new, var_new
             log_w = torch.log(weights.clamp_min(1e-30))
 
             if abs(lb - prev_lb) < self.tol:
                 break
             prev_lb = lb
 
-        labels_b = ids if (self.compute_labels_on_fit and ids is not None) else None
+        if self.compute_labels_on_fit:
+            ids = _cuda_mod.diag_assign(x_b, means, var, log_w)
+        labels_b = ids if self.compute_labels_on_fit else None
         info = {
             "lower_bound": lb,
             "lower_bound_history": lower_bound_history,
@@ -700,13 +715,13 @@ class GMMXX:
 
         for _ in range(self.niter):
             n_iter += 1
-            ids = _cuda_mod.tied_assign(x_b, means, L, log_w)
             lse = _cuda_mod.tied_logsumexp(x_b, means, L, log_w)
             lb = float(lse.mean().item())
             lower_bound_history.append(lb)
 
-            # M-step: blocked_update_spherical reuses for sums (ignore sumsq output).
-            sums, _, counts = _cuda_mod.blocked_update_spherical(x_b, ids, K)
+            resp = _cuda_mod.tied_resp(x_b, means, L, log_w, lse)
+            counts = resp.sum(dim=1)
+            sums = torch.bmm(resp.transpose(1, 2), x_b_f)
             means, L, weights = _cuda_mod.tied_finalize(
                 sums, xx_total, counts, N, self.reg_covar
             )
@@ -719,7 +734,9 @@ class GMMXX:
         # GMMXX exposes covariances_ as the full (D, D) covariance matrix.
         cov_b = L @ L.transpose(-1, -2)  # (B, D, D)
 
-        labels_b = ids if (self.compute_labels_on_fit and ids is not None) else None
+        if self.compute_labels_on_fit:
+            ids = _cuda_mod.tied_assign(x_b, means, L, log_w)
+        labels_b = ids if self.compute_labels_on_fit else None
         info = {
             "lower_bound": lb,
             "lower_bound_history": lower_bound_history,
@@ -766,6 +783,7 @@ class GMMXX:
         L = (sqrt_var.to(x_b.dtype) * eye.expand(B, K, D, D)).contiguous()  # (B, K, D, D)
         log_w = torch.full((B, K), -math.log(K), dtype=torch.float32, device=device)
         weights = torch.full((B, K), 1.0 / K, dtype=torch.float32, device=device)
+        x_b_f = x_b.float()
 
         lower_bound_history: list[float] = []
         n_iter = 0
@@ -775,12 +793,14 @@ class GMMXX:
 
         for _ in range(self.niter):
             n_iter += 1
-            ids = _cuda_mod.full_assign(x_b, means, L, log_w)
             lse = _cuda_mod.full_logsumexp(x_b, means, L, log_w)
             lb = float(lse.mean().item())
             lower_bound_history.append(lb)
 
-            sums, outer_sums, counts = _cuda_mod.full_blocked_update(x_b, ids, K)
+            resp = _cuda_mod.full_resp(x_b, means, L, log_w, lse)
+            counts = resp.sum(dim=1)
+            sums = torch.bmm(resp.transpose(1, 2), x_b_f)
+            outer_sums = torch.einsum("bnk,bnd,bne->bkde", resp, x_b_f, x_b_f)
             means, L, weights = _cuda_mod.full_finalize(
                 sums, outer_sums, counts, means, L, N, self.reg_covar
             )
@@ -793,7 +813,9 @@ class GMMXX:
         # GMMXX exposes covariances_ as the full (B, K, D, D) Σ_k.
         cov_b = L @ L.transpose(-1, -2)  # (B, K, D, D)
 
-        labels_b = ids if (self.compute_labels_on_fit and ids is not None) else None
+        if self.compute_labels_on_fit:
+            ids = _cuda_mod.full_assign(x_b, means, L, log_w)
+        labels_b = ids if self.compute_labels_on_fit else None
         info = {
             "lower_bound": lb,
             "lower_bound_history": lower_bound_history,

@@ -827,8 +827,7 @@ def full_finalize(
 
     L_new, info = torch.linalg.cholesky_ex(sigma)
 
-    counts_int = counts.to(torch.int32) if counts.dtype != torch.int32 else counts
-    failed = (info != 0) | (counts_int <= 0)  # (B, K) bool
+    failed = (info != 0) | (counts_f <= 0.0)  # (B, K) bool
     if failed.any():
         # Cast old_means / old_L to fp32 for arithmetic, then back at the end.
         old_means_f = old_means.float()
