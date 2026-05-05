@@ -288,15 +288,22 @@ def soft_update_spherical(
             nk = resp.sum(dim=1)
             sum_x = torch.bmm(resp.transpose(1, 2), x_f)
             sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
+        # Finalize. Combine ops where possible to minimize kernel launches.
         nk_safe = nk.clamp_min(1e-8)
         active_mask = nk > 1e-8
-        means_new = (sum_x / nk_safe.unsqueeze(-1)).to(x.dtype)
+        # means_new dtype: same as x in this path (sum_x is fp32, x is fp32).
+        # Skip the explicit .to(x.dtype) cast.
+        same_dtype = (sum_x.dtype == x.dtype)
+        means_new = sum_x / nk_safe.unsqueeze(-1)
+        if not same_dtype:
+            means_new = means_new.to(x.dtype)
         means_new = torch.where(active_mask.unsqueeze(-1), means_new, means)
-        mean_sq = means_new.float().square().sum(dim=-1)
-        var_new = (sum_x_sq - nk * mean_sq).clamp_min(0.0) / (
-            nk_safe * float(D)
-        )
-        var_new = var_new.clamp_min(float(reg_covar))
+        # mean_sq from means_new: sum_x is fp32 already. .float() is no-op.
+        mean_sq = means_new.square().sum(dim=-1) if means_new.dtype == torch.float32 \
+                  else means_new.float().square().sum(dim=-1)
+        # Fold the .clamp_min(0.0) → .clamp_min(reg_covar) since reg_covar > 0.
+        var_new = ((sum_x_sq - nk * mean_sq) / (nk_safe * float(D))) \
+                    .clamp_min(float(reg_covar))
         var_new = torch.where(active_mask, var_new, var)
         weights = (nk / float(N)).clamp_min(1e-8)
         weights = weights / weights.sum(dim=-1, keepdim=True)
