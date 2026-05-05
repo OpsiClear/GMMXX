@@ -480,9 +480,19 @@ class GMMXX:
         # Exp3: fused kernel is SIMT-only (no sm80 mma); for fp16/bf16 the
         # separate sm80-mma E-step + soft M-step path beats fused-SIMT by
         # leveraging tensor cores via cuBLAS / mma.sync.
+        # Exp13: for fp32 with D >= 16 the cuBLAS GEMM fastpath inside
+        # spherical_logsumexp/_resp uses TF32 tensor cores and beats the
+        # SIMT fused kernel. Disable fused there so we route through
+        # use_soft_update -> cuBLAS path.
+        from . import _cuda as _cm_local
+        cublas_fastpath = (
+            x_b.dtype == torch.float32
+            and _cm_local._use_torch_fastpath_spherical(x_b)
+        )
         use_fused = (
             not use_approx
             and x_b.dtype == torch.float32
+            and not cublas_fastpath
             and _gm_runtime.cuda_spherical_fused_supported(D, K, x_b.dtype)
         )
         use_soft_update = not use_approx and not use_fused and D <= 128 and K <= 256
