@@ -121,6 +121,12 @@ def test_largen_cuda_training_matches_soft_em_torch_path(covariance_type, n, d, 
         tol=0.0,
         init_params="random",
         kmeans_use_triton=False,
+        # Disable Triton on the torch reference so both paths use cuBLAS-class
+        # arithmetic. Triton's tl.dot(input_precision="tf32x3") and cuBLAS TF32
+        # are different fp modes; under the strict 1e-4 tolerance their drift
+        # over 3 iterations (~0.04 on full D=4) breaks an otherwise-correct
+        # apples-to-apples comparison.
+        gmm_use_triton=False,
         chunk_size_N=257,
         chunk_size_K=2,
     )
