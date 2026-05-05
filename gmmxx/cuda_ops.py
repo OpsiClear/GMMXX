@@ -26,6 +26,7 @@ diag_assign = _cuda.diag_assign
 diag_logsumexp = _cuda.diag_logsumexp
 diag_resp = _cuda.diag_resp
 blocked_update_diag = _cuda.blocked_update_diag
+blocked_update_diag_sorted = _cuda.blocked_update_diag_sorted
 finalize_diag = _cuda.finalize_diag
 
 # Tied (Plan 7).
@@ -64,6 +65,7 @@ __all__ = [
     "diag_logsumexp",
     "diag_resp",
     "blocked_update_diag",
+    "blocked_update_diag_sorted",
     "finalize_diag",
     "tied_project",
     "tied_log_det",

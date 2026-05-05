@@ -18,6 +18,14 @@ void blocked_update(const at::Tensor& x,
                     at::Tensor& sumsq_out,
                     at::Tensor& counts_out);
 
+// Sorted-run variant. Caller pre-sorts cluster_ids and gathers x to match.
+// Emits one atomic per (block-local run, feature) instead of per token.
+void blocked_update_sorted(const at::Tensor& x_sorted,
+                           const at::Tensor& sorted_ids,
+                           at::Tensor& sums_out,
+                           at::Tensor& sumsq_out,
+                           at::Tensor& counts_out);
+
 // Finalize: divide sums/counts, clamp per-feature variance to reg_covar.
 //
 // old_means: (B, K, D) — preserved when count[k] == 0.

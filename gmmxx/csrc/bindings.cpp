@@ -105,6 +105,11 @@ NB_MODULE(_C, m) {
           "Diagonal M-step accumulator. Caller MUST zero sums_out (B,K,D), "
           "sumsq_out (B,K,D), counts_out (B,K) before calling.");
 
+    m.def("blocked_update_diag_sorted", &gmmxx::mstep::diag::blocked_update_sorted,
+          nb::arg("x_sorted"), nb::arg("sorted_ids"),
+          nb::arg("sums_out"), nb::arg("sumsq_out"), nb::arg("counts_out"),
+          "Sorted-run diagonal M-step. Caller pre-sorts cluster_ids and gathers x.");
+
     m.def("finalize_diag", &gmmxx::mstep::diag::finalize,
           nb::arg("sums"), nb::arg("sumsq"), nb::arg("counts"),
           nb::arg("old_means"), nb::arg("old_var"),

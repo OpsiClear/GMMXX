@@ -442,9 +442,14 @@ def blocked_update_diag(
     x: torch.Tensor,
     cluster_ids: torch.Tensor,
     n_components: int,
+    *,
+    force_sort: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Diagonal M-step accumulator. Allocates and zero-initializes
-    sums (B,K,D), sumsq (B,K,D), counts (B,K)."""
+    """Diagonal M-step accumulator.
+
+    Picks sorted-run vs per-token by the same N*K heuristic used by spherical.
+    force_sort: True forces sorted path; False forces per-token; None auto.
+    """
     require_cuda()
     x = _check_input(x, "x")
     cluster_ids = _check_input(cluster_ids, "cluster_ids", dtype=torch.int32)
@@ -453,12 +458,50 @@ def blocked_update_diag(
     sums = torch.zeros((B, K, D), dtype=torch.float32, device=x.device)
     sumsq = torch.zeros((B, K, D), dtype=torch.float32, device=x.device)
     counts = torch.zeros((B, K), dtype=torch.int32, device=x.device)
+    use_sort = force_sort if force_sort is not None else (N * K >= _SORT_THRESHOLD_NK)
     try:
-        _C.blocked_update_diag(x, cluster_ids, sums, sumsq, counts)
+        if use_sort:
+            sorted_ids, perm = cluster_ids.sort(dim=1)
+            x_sorted = torch.gather(x, 1, perm.unsqueeze(-1).expand(-1, -1, D))
+            _C.blocked_update_diag_sorted(
+                x_sorted.contiguous(), sorted_ids.int().contiguous(),
+                sums, sumsq, counts,
+            )
+        else:
+            _C.blocked_update_diag(x, cluster_ids, sums, sumsq, counts)
     except RuntimeError as exc:
         if _no_fallback():
             raise
-        raise CudaRuntimeFallback(f"blocked_update_diag failed: {exc}") from exc
+        raise CudaRuntimeFallback(
+            f"blocked_update_diag (use_sort={use_sort}) failed: {exc}"
+        ) from exc
+    return sums, sumsq, counts
+
+
+def blocked_update_diag_sorted(
+    x_sorted: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    n_components: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Direct sorted-run diagonal wrapper.
+
+    Caller is responsible for sorting cluster_ids and gathering x to match.
+    Most users should call blocked_update_diag(..., force_sort=...).
+    """
+    require_cuda()
+    x_sorted = _check_input(x_sorted, "x_sorted")
+    sorted_ids = _check_input(sorted_ids, "sorted_ids", dtype=torch.int32)
+    B, N, D = x_sorted.shape
+    K = int(n_components)
+    sums = torch.zeros((B, K, D), dtype=torch.float32, device=x_sorted.device)
+    sumsq = torch.zeros((B, K, D), dtype=torch.float32, device=x_sorted.device)
+    counts = torch.zeros((B, K), dtype=torch.int32, device=x_sorted.device)
+    try:
+        _C.blocked_update_diag_sorted(x_sorted, sorted_ids, sums, sumsq, counts)
+    except RuntimeError as exc:
+        if _no_fallback():
+            raise
+        raise CudaRuntimeFallback(f"blocked_update_diag_sorted failed: {exc}") from exc
     return sums, sumsq, counts
 
 

@@ -122,6 +122,7 @@ def _build_extension():
         str(CSRC / "mstep" / "blocked_spherical_sorted.cu"),
         str(CSRC / "mstep" / "finalize_spherical.cu"),
         str(CSRC / "mstep" / "blocked_diag.cu"),
+        str(CSRC / "mstep" / "blocked_diag_sorted.cu"),
         str(CSRC / "mstep" / "finalize_diag.cu"),
         str(CSRC / "fused" / "spherical_fused.cu"),
         str(nb_combined),
