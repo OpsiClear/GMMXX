@@ -44,12 +44,14 @@ def _bench_triton_forced(N: int, D: int, K: int, dtype: torch.dtype, n_iter: int
     from gmmxx.torch_fallback import batch_gmm_Spherical_torch_native
     torch.manual_seed(0)
     x_b = torch.randn(1, N, D, device="cuda", dtype=dtype)
-    batch_gmm_Spherical_torch_native(
-        x_b, K, max_iters=2, tol=0, init_params="random",
-        kmeans_use_triton=True,
-        gmm_use_triton_estep=True,
-        gmm_use_triton_streaming_update=True,
-    )
+    # Multiple warmup fits to stabilize cache state, autotune.
+    for _ in range(3):
+        batch_gmm_Spherical_torch_native(
+            x_b, K, max_iters=2, tol=0, init_params="random",
+            kmeans_use_triton=True,
+            gmm_use_triton_estep=True,
+            gmm_use_triton_streaming_update=True,
+        )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     batch_gmm_Spherical_torch_native(
@@ -67,11 +69,12 @@ def _bench_one(backend: str, N: int, D: int, K: int, dtype: torch.dtype, n_iter:
     torch.manual_seed(0)
     device = "cuda" if backend in {"cuda", "triton"} else "cpu"
     x = torch.randn(N, D, device=device, dtype=dtype)
-    # Warm-up
-    GMMXX(
-        n_components=K, max_iter=2, tol=0, random_state=0,
-        covariance_type="spherical", backend=backend,
-    ).fit(x)
+    # Multiple warmup fits to amortize CUDA kernel cache, allocator state.
+    for _ in range(3):
+        GMMXX(
+            n_components=K, max_iter=2, tol=0, random_state=0,
+            covariance_type="spherical", backend=backend,
+        ).fit(x)
     if device == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
