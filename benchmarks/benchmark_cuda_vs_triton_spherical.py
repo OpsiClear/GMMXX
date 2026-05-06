@@ -69,18 +69,22 @@ def _bench_one(backend: str, N: int, D: int, K: int, dtype: torch.dtype, n_iter:
     torch.manual_seed(0)
     device = "cuda" if backend in {"cuda", "triton"} else "cpu"
     x = torch.randn(N, D, device=device, dtype=dtype)
+    # Pass dtype= so GMMXX preserves the input dtype rather than auto-promoting
+    # fp16/bf16 to fp32 internally. Otherwise this harness's "fp16"/"bf16"
+    # labels are misleading — it would measure the fp32 cuBLAS chunked path
+    # for both the explicit-fp32 and the auto-promoted-from-fp16 cells.
     # Multiple warmup fits to amortize CUDA kernel cache, allocator state.
     for _ in range(3):
         GMMXX(
             n_components=K, max_iter=2, tol=0, random_state=0,
-            covariance_type="spherical", backend=backend,
+            covariance_type="spherical", backend=backend, dtype=dtype,
         ).fit(x)
     if device == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     GMMXX(
         n_components=K, max_iter=n_iter, tol=0, random_state=0,
-        covariance_type="spherical", backend=backend,
+        covariance_type="spherical", backend=backend, dtype=dtype,
     ).fit(x)
     if device == "cuda":
         torch.cuda.synchronize()
