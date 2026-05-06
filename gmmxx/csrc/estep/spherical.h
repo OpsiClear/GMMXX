@@ -90,4 +90,17 @@ std::tuple<at::Tensor, at::Tensor> prepare_estep(
     const at::Tensor& means,
     const at::Tensor& var);
 
+// Exp62: fused logsumexp + resp sm80 kernel.
+// Returns (lse, resp). lse is empty when need_lse is false. If no tile fits
+// (e.g. K > BLOCK_K of every available tile), returns two empty tensors —
+// caller must fall back to the separate logsumexp+resp pipeline.
+std::tuple<at::Tensor, at::Tensor> logsumexp_resp_sm80(
+    const at::Tensor& x,
+    const at::Tensor& means,
+    const at::Tensor& var,
+    const at::Tensor& log_w,
+    const at::Tensor& x_sq,
+    const at::Tensor& c_sq,
+    bool need_lse);
+
 }}}  // namespace gmmxx::estep::spherical

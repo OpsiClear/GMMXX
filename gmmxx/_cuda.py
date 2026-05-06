@@ -357,16 +357,36 @@ def soft_update_spherical(
                 means.float().pow(2).sum(-1).contiguous()
                 if means.is_contiguous() else None
             )
-            lse = spherical_logsumexp(
-                x, means, var, log_w,
-                x_sq=x_sq_for_kernel, c_sq=c_sq_for_kernel,
-            )
-            resp = spherical_resp(
-                x, means, var, log_w, lse,
-                x_sq=x_sq_for_kernel, c_sq=c_sq_for_kernel,
-            )
-            if not compute_lse:
-                lse = None
+            # Exp62: try the fused logsumexp+resp sm80 kernel first (one
+            # GEMM-equivalent + one launch instead of two). The kernel only
+            # handles K <= BLOCK_K of the smallest available tile (64 here),
+            # and returns empty tensors as a sentinel when no tile fits —
+            # in which case we fall back to the separate logsumexp+resp path.
+            fused_ok = False
+            if x_sq_for_kernel is not None and c_sq_for_kernel is not None:
+                try:
+                    lse_or_empty, resp_or_empty = _C.spherical_logsumexp_resp_sm80(
+                        x, means, var, log_w,
+                        x_sq_for_kernel, c_sq_for_kernel,
+                        bool(compute_lse),
+                    )
+                    if resp_or_empty.numel() > 0:
+                        lse = lse_or_empty if compute_lse else None
+                        resp = resp_or_empty
+                        fused_ok = True
+                except RuntimeError:
+                    fused_ok = False
+            if not fused_ok:
+                lse = spherical_logsumexp(
+                    x, means, var, log_w,
+                    x_sq=x_sq_for_kernel, c_sq=c_sq_for_kernel,
+                )
+                resp = spherical_resp(
+                    x, means, var, log_w, lse,
+                    x_sq=x_sq_for_kernel, c_sq=c_sq_for_kernel,
+                )
+                if not compute_lse:
+                    lse = None
         ids = resp.argmax(dim=-1).to(torch.int32) if (resp is not None and compute_ids) else None
         if x_aug_cached is not None and resp is None:
             # Chunked-streaming mode already produced sum_aug above.

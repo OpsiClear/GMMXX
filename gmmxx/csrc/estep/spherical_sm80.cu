@@ -1128,6 +1128,337 @@ resp_sm80_kernel(
 }  // resp_sm80_kernel
 
 // ------------------------------------------------------------------
+// logsumexp_resp_sm80_kernel — fused logsumexp + resp.
+//
+// Same outer template as logsumexp_sm80; runs ONE GEMM pass, caches per-row
+// per-K logits in registers, then in a second epilogue pass computes
+// resp[n,k] = exp(logit[n,k] - lse[n]) and writes both lse[n] and resp[n,k].
+//
+// Constraint: K must be <= BLOCK_K (single K-chunk). The dispatcher gates
+// this so callers never trip the assertion path.
+//
+// Compared to calling logsumexp_sm80 + resp_sm80 separately, this saves
+// one full GEMM-equivalent of work (each kernel currently runs the full
+// GEMM independently) and one kernel launch.
+// ------------------------------------------------------------------
+template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA>
+__global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
+logsumexp_resp_sm80_kernel(
+    const T*     __restrict__ x,          // (B, N, D)
+    const T*     __restrict__ means,      // (B, K, D)
+    const float* __restrict__ var,        // (B, K)
+    const float* __restrict__ log_w,      // (B, K)
+    const float* __restrict__ x_sq,       // (B, N)
+    const float* __restrict__ c_sq,       // (B, K)
+    float*       __restrict__ lse_out,    // (B, N)  fp32 — may be nullptr
+    float*       __restrict__ resp_out,   // (B, N, K) fp32
+    int B, int N, int K, int D) {
+
+    constexpr int THREADS_PER_CTA  = WARPS_PER_CTA * 32;
+    constexpr int WARP_M           = BLOCK_N / WARPS_PER_CTA;
+    constexpr int M_ATOMS_PER_WARP = WARP_M / 16;
+    constexpr int N_ATOMS_PER_WARP = BLOCK_K / 8;
+    constexpr int PIPE_STAGES      = 2;
+
+    static_assert(WARP_M >= 16 && (WARP_M % 16) == 0,
+                  "WARP_M must be >= 16 and a multiple of 16");
+    static_assert((BLOCK_K % 8) == 0, "BLOCK_K must be a multiple of 8");
+    static_assert((N_ATOMS_PER_WARP % 2) == 0,
+                  "ldmatrix.x4 covers 2 N-atoms; N_ATOMS_PER_WARP must be even");
+
+    const int pid_b   = blockIdx.y;
+    const int n_start = blockIdx.x * BLOCK_N;
+    const int n_count = min(BLOCK_N, N - n_start);
+    if (n_count <= 0) return;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / kWarp;
+    const int lane    = tid % kWarp;
+    const int D_SMEM  = D + SMEM_PAD;
+
+    extern __shared__ unsigned char smem_raw[];
+    T*     x_smem   = reinterpret_cast<T*>(smem_raw);
+    T*     c_smem   = x_smem + (size_t)BLOCK_N * D_SMEM;
+    float* csq_smem = reinterpret_cast<float*>(
+                          c_smem + (size_t)PIPE_STAGES * BLOCK_K * D_SMEM);
+
+    const int row_top_in_warp = lane / 4;
+    const int row_bot_in_warp = row_top_in_warp + 8;
+    const int col_in_atom     = (lane % 4) * 2;
+
+    const int ldm_row_off      = (lane & 8)  ? 8 : 0;
+    const int ldm_col_off      = (lane & 16) ? 8 : 0;
+    const int ldm_row_in_half  = lane & 7;
+    const int ldm_n_atom_off   = (lane & 8) ? 8 : 0;
+
+    // K must fit in one chunk; dispatcher enforces this. Asserts removed for
+    // perf — the K<=BLOCK_K invariant holds at the call site.
+    const int num_k_chunks = 1;
+
+    // Load x_smem.
+    async_load_tile<T, THREADS_PER_CTA>(
+        x_smem,
+        x + (size_t)pid_b * N * D + (size_t)n_start * D,
+        n_count, BLOCK_N, D, D_SMEM);
+    ptx::cp_async_commit();
+
+    // Load the (single) means / c_sq tile.
+    {
+        T* c_dst = c_smem;
+        async_load_tile<T, THREADS_PER_CTA>(
+            c_dst,
+            means + (size_t)pid_b * K * D,
+            K, BLOCK_K, D, D_SMEM);
+        load_csq_tile<THREADS_PER_CTA>(
+            csq_smem, c_sq + (size_t)pid_b * K, K, BLOCK_K);
+        ptx::cp_async_commit();
+    }
+    ptx::cp_async_wait_group<0>();
+    __syncthreads();
+
+    // Cache x_sq per row in registers.
+    float xs_top_cache[M_ATOMS_PER_WARP];
+    float xs_bot_cache[M_ATOMS_PER_WARP];
+    bool  top_valid_cache[M_ATOMS_PER_WARP];
+    bool  bot_valid_cache[M_ATOMS_PER_WARP];
+
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
+        int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
+        top_valid_cache[m] = (row_top < n_count);
+        bot_valid_cache[m] = (row_bot < n_count);
+        xs_top_cache[m] = top_valid_cache[m]
+            ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
+        xs_bot_cache[m] = bot_valid_cache[m]
+            ? x_sq[(size_t)pid_b * N + n_start + row_bot] : 0.f;
+    }
+
+    // ------ Single GEMM pass ------
+    float acc[M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][4];
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m)
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; ++n)
+            acc[m][n][0] = acc[m][n][1] = acc[m][n][2] = acc[m][n][3] = 0.f;
+
+    #pragma unroll 4
+    for (int d_off = 0; d_off < D; d_off += BLOCK_D) {
+        uint32_t a_regs[M_ATOMS_PER_WARP][4];
+        #pragma unroll
+        for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+            int m_base = warp_id * WARP_M + m * 16;
+            int row    = m_base + ldm_row_off + ldm_row_in_half;
+            unsigned int smem_addr = ptx::cvta_to_shared(
+                x_smem + (size_t)row * D_SMEM + d_off + ldm_col_off);
+            ptx::ldmatrix_x4(a_regs[m][0], a_regs[m][1],
+                             a_regs[m][2], a_regs[m][3], smem_addr);
+        }
+
+        uint32_t b_regs[N_ATOMS_PER_WARP][2];
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; n += 2) {
+            int n_col = n * 8 + ldm_n_atom_off + ldm_row_in_half;
+            unsigned int smem_addr = ptx::cvta_to_shared(
+                c_smem + (size_t)n_col * D_SMEM + d_off + ldm_col_off);
+            uint32_t r0, r1, r2, r3;
+            ptx::ldmatrix_x4(r0, r1, r2, r3, smem_addr);
+            b_regs[n    ][0] = r0;
+            b_regs[n + 1][0] = r1;
+            b_regs[n    ][1] = r2;
+            b_regs[n + 1][1] = r3;
+        }
+
+        #pragma unroll
+        for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+            #pragma unroll
+            for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+                if constexpr (std::is_same<T, __half>::value ||
+                              std::is_same<T, at::Half>::value) {
+                    ptx::mma_m16n8k16_fp16(
+                        acc[m][n][0], acc[m][n][1],
+                        acc[m][n][2], acc[m][n][3],
+                        a_regs[m][0], a_regs[m][1],
+                        a_regs[m][2], a_regs[m][3],
+                        b_regs[n][0], b_regs[n][1],
+                        acc[m][n][0], acc[m][n][1],
+                        acc[m][n][2], acc[m][n][3]);
+                } else {
+                    ptx::mma_m16n8k16_bf16(
+                        acc[m][n][0], acc[m][n][1],
+                        acc[m][n][2], acc[m][n][3],
+                        a_regs[m][0], a_regs[m][1],
+                        a_regs[m][2], a_regs[m][3],
+                        b_regs[n][0], b_regs[n][1],
+                        acc[m][n][0], acc[m][n][1],
+                        acc[m][n][2], acc[m][n][3]);
+                }
+            }
+        }
+    }  // d-loop
+
+    // ------ Pass 1: convert cross-products to logits, build LSE per row.
+    // Cache the per-row per-k LOGIT VALUES in registers (overwriting acc[]).
+    const float* var_b   = var   + (size_t)pid_b * K;
+    const float* log_w_b = log_w + (size_t)pid_b * K;
+    const float half_D_log2pi = 0.5f * (float)D * 1.8378770664f;
+
+    LSE lse_top[M_ATOMS_PER_WARP];
+    LSE lse_bot[M_ATOMS_PER_WARP];
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        lse_top[m] = LSE{-FLT_MAX, 0.f};
+        lse_bot[m] = LSE{-FLT_MAX, 0.f};
+    }
+
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        const float xs_top = xs_top_cache[m];
+        const float xs_bot = xs_bot_cache[m];
+        const bool  tv     = top_valid_cache[m];
+        const bool  bv     = bot_valid_cache[m];
+
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+            int k_in_chunk_0 = n * 8 + col_in_atom;
+            int k_in_chunk_1 = k_in_chunk_0 + 1;
+            int k0 = k_in_chunk_0;
+            int k1 = k_in_chunk_1;
+            bool k0v = (k0 < K);
+            bool k1v = (k1 < K);
+
+            float cross_top0 = acc[m][n][0];
+            float cross_top1 = acc[m][n][1];
+            float cross_bot0 = acc[m][n][2];
+            float cross_bot1 = acc[m][n][3];
+
+            float cs0 = csq_smem[k_in_chunk_0];
+            float cs1 = csq_smem[k_in_chunk_1];
+
+            // Convert cross-product to logit, store back into acc[].
+            float logit_top0 = -INFINITY, logit_top1 = -INFINITY;
+            float logit_bot0 = -INFINITY, logit_bot1 = -INFINITY;
+            if (k0v) {
+                float v0 = var_b[k0];
+                float dist_t = xs_top + cs0 - 2.f * cross_top0;
+                float dist_b = xs_bot + cs0 - 2.f * cross_bot0;
+                if (dist_t < 0.f) dist_t = 0.f;
+                if (dist_b < 0.f) dist_b = 0.f;
+                float pre = log_w_b[k0] - half_D_log2pi - 0.5f * (float)D * logf(v0);
+                logit_top0 = pre - 0.5f * dist_t / v0;
+                logit_bot0 = pre - 0.5f * dist_b / v0;
+            }
+            if (k1v) {
+                float v1 = var_b[k1];
+                float dist_t = xs_top + cs1 - 2.f * cross_top1;
+                float dist_b = xs_bot + cs1 - 2.f * cross_bot1;
+                if (dist_t < 0.f) dist_t = 0.f;
+                if (dist_b < 0.f) dist_b = 0.f;
+                float pre = log_w_b[k1] - half_D_log2pi - 0.5f * (float)D * logf(v1);
+                logit_top1 = pre - 0.5f * dist_t / v1;
+                logit_bot1 = pre - 0.5f * dist_b / v1;
+            }
+
+            // Cache logit values (overwriting acc registers).
+            acc[m][n][0] = logit_top0;
+            acc[m][n][1] = logit_top1;
+            acc[m][n][2] = logit_bot0;
+            acc[m][n][3] = logit_bot1;
+
+            // LSE updates (skip lanes whose row is out-of-range).
+            if (tv && k0v) update_lse(lse_top[m], logit_top0);
+            if (tv && k1v) update_lse(lse_top[m], logit_top1);
+            if (bv && k0v) update_lse(lse_bot[m], logit_bot0);
+            if (bv && k1v) update_lse(lse_bot[m], logit_bot1);
+        }
+    }
+
+    // ------ Reduce (m, s) across the 4 lanes that share a row. ------
+    auto warp_reduce_lse = [&](LSE& l) {
+        #pragma unroll
+        for (int offset : {1, 2}) {
+            float other_m = __shfl_xor_sync(0xffffffff, l.m, offset, 4);
+            float other_s = __shfl_xor_sync(0xffffffff, l.s, offset, 4);
+            float new_m   = fmaxf(l.m, other_m);
+            float a = (l.m   == -FLT_MAX) ? 0.f : l.s * __expf(l.m   - new_m);
+            float b = (other_m == -FLT_MAX) ? 0.f : other_s * __expf(other_m - new_m);
+            l.m = new_m;
+            l.s = a + b;
+        }
+    };
+
+    float ln_top[M_ATOMS_PER_WARP];
+    float ln_bot[M_ATOMS_PER_WARP];
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        warp_reduce_lse(lse_top[m]);
+        warp_reduce_lse(lse_bot[m]);
+        ln_top[m] = (lse_top[m].s > 0.f)
+                    ? (lse_top[m].m + logf(lse_top[m].s)) : -INFINITY;
+        ln_bot[m] = (lse_bot[m].s > 0.f)
+                    ? (lse_bot[m].m + logf(lse_bot[m].s)) : -INFINITY;
+    }
+
+    // ------ Optionally write lse_out (lane%4==0 owns the row). ------
+    if (lse_out != nullptr && (lane % 4) == 0) {
+        #pragma unroll
+        for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+            int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
+            int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
+            if (row_top < n_count) {
+                lse_out[(size_t)pid_b * N + n_start + row_top] = ln_top[m];
+            }
+            if (row_bot < n_count) {
+                lse_out[(size_t)pid_b * N + n_start + row_bot] = ln_bot[m];
+            }
+        }
+    }
+
+    // ------ Pass 2: write resp[n,k] = exp(logit - lse). ------
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
+        int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
+        const float lt = ln_top[m];
+        const float lb = ln_bot[m];
+
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+            int k_in_chunk_0 = n * 8 + col_in_atom;
+            int k_in_chunk_1 = k_in_chunk_0 + 1;
+            int k0 = k_in_chunk_0;
+            int k1 = k_in_chunk_1;
+            bool k0v = (k0 < K);
+            bool k1v = (k1 < K);
+
+            const size_t base_top = ((size_t)pid_b * N + n_start + row_top) * (size_t)K;
+            const size_t base_bot = ((size_t)pid_b * N + n_start + row_bot) * (size_t)K;
+
+            if (top_valid_cache[m]) {
+                if (k0v) {
+                    float r0 = (lt == -INFINITY) ? 0.f : __expf(acc[m][n][0] - lt);
+                    resp_out[base_top + k0] = r0;
+                }
+                if (k1v) {
+                    float r1 = (lt == -INFINITY) ? 0.f : __expf(acc[m][n][1] - lt);
+                    resp_out[base_top + k1] = r1;
+                }
+            }
+            if (bot_valid_cache[m]) {
+                if (k0v) {
+                    float r0 = (lb == -INFINITY) ? 0.f : __expf(acc[m][n][2] - lb);
+                    resp_out[base_bot + k0] = r0;
+                }
+                if (k1v) {
+                    float r1 = (lb == -INFINITY) ? 0.f : __expf(acc[m][n][3] - lb);
+                    resp_out[base_bot + k1] = r1;
+                }
+            }
+        }
+    }
+}  // logsumexp_resp_sm80_kernel
+
+// ------------------------------------------------------------------
 // SMEM size computation
 // ------------------------------------------------------------------
 static inline size_t smem_bytes_assign(
@@ -1245,6 +1576,44 @@ static void launch_resp_sm80_typed(
         c_sq.data_ptr<float>(),
         log_norm.data_ptr<float>(),
         out.data_ptr<float>(),
+        B, N, K, D);
+}
+
+// ------------------------------------------------------------------
+// Typed launcher (fused logsumexp+resp)
+// ------------------------------------------------------------------
+template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_>
+static void launch_logsumexp_resp_sm80_typed(
+    const at::Tensor& x,
+    const at::Tensor& means,
+    const at::Tensor& var,
+    const at::Tensor& log_w,
+    const at::Tensor& x_sq,
+    const at::Tensor& c_sq,
+    at::Tensor*       lse_out,        // optional
+    at::Tensor&       resp_out,
+    int B, int N, int K, int D,
+    cudaStream_t stream) {
+
+    size_t smem_bytes = smem_bytes_assign(BLOCK_N_, BLOCK_K_, D, sizeof(T));
+
+    auto fn = logsumexp_resp_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_>;
+    if (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem_bytes));
+    }
+
+    dim3 grid((N + BLOCK_N_ - 1) / BLOCK_N_, B);
+    dim3 block(WARPS_ * 32);
+    fn<<<grid, block, smem_bytes, stream>>>(
+        reinterpret_cast<const T*>(x.data_ptr()),
+        reinterpret_cast<const T*>(means.data_ptr()),
+        var.data_ptr<float>(),
+        log_w.data_ptr<float>(),
+        x_sq.data_ptr<float>(),
+        c_sq.data_ptr<float>(),
+        lse_out ? lse_out->data_ptr<float>() : nullptr,
+        resp_out.data_ptr<float>(),
         B, N, K, D);
 }
 
@@ -1580,6 +1949,96 @@ at::Tensor resp_sm80(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
+}
+
+// ------------------------------------------------------------------
+// Public API: logsumexp_resp_sm80 (Exp62 — fused E-step kernel)
+//
+// Returns (lse, resp) in one kernel launch. Constraint: K must be <=
+// BLOCK_K of the chosen tile (the kernel only does one K-chunk).
+// Returns std::nullopt if no tile fits — caller must fall back.
+// ------------------------------------------------------------------
+std::tuple<at::Tensor, at::Tensor> logsumexp_resp_sm80(
+    const at::Tensor& x,
+    const at::Tensor& means,
+    const at::Tensor& var,
+    const at::Tensor& log_w,
+    const at::Tensor& x_sq,
+    const at::Tensor& c_sq,
+    bool need_lse) {
+
+    _check_sm80_inputs(x, means, var, log_w, x_sq, c_sq);
+    c10::cuda::CUDAGuard guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int B = (int)x.size(0);
+    int N = (int)x.size(1);
+    int D = (int)x.size(2);
+    int K = (int)means.size(1);
+
+    auto resp = at::empty({B, N, K}, x.options().dtype(at::kFloat));
+    at::Tensor lse;
+    at::Tensor* lse_ptr = nullptr;
+    if (need_lse) {
+        lse = at::empty({B, N}, x.options().dtype(at::kFloat));
+        lse_ptr = &lse;
+    } else {
+        lse = at::empty({0}, x.options().dtype(at::kFloat));
+    }
+
+    if (N == 0) return std::make_tuple(lse, resp);
+
+    int dev = x.device().index();
+    cudaDeviceProp props{};
+    cudaGetDeviceProperties(&props, dev);
+    size_t smem_limit = props.sharedMemPerBlockOptin;
+    if (smem_limit == 0) smem_limit = props.sharedMemPerBlock;
+
+    auto try_launch = [&](auto tag, int bn, int bk, int warps) -> bool {
+        using T = decltype(tag);
+        // Constraint: kernel only handles K <= BLOCK_K (single K-chunk).
+        if (K > bk) return false;
+        size_t smem = smem_bytes_assign(bn, bk, D, sizeof(T));
+        if (smem > smem_limit) return false;
+        if (bn == 128 && bk == 64 && warps == 4) {
+            launch_logsumexp_resp_sm80_typed<T, 128, 64, 4>(
+                x, means, var, log_w, x_sq, c_sq, lse_ptr, resp,
+                B, N, K, D, stream);
+            return true;
+        }
+        if (bn == 128 && bk == 32 && warps == 4) {
+            launch_logsumexp_resp_sm80_typed<T, 128, 32, 4>(
+                x, means, var, log_w, x_sq, c_sq, lse_ptr, resp,
+                B, N, K, D, stream);
+            return true;
+        }
+        if (bn == 64 && bk == 32 && warps == 4) {
+            launch_logsumexp_resp_sm80_typed<T, 64, 32, 4>(
+                x, means, var, log_w, x_sq, c_sq, lse_ptr, resp,
+                B, N, K, D, stream);
+            return true;
+        }
+        return false;
+    };
+
+    bool launched = false;
+    if (x.scalar_type() == at::kHalf) {
+        if (K <= 32) launched = try_launch(__half{}, 128, 32, 4);
+        if (!launched && K <= 64) launched = try_launch(__half{}, 128, 64, 4);
+        if (!launched && K <= 32) launched = try_launch(__half{}, 64, 32, 4);
+    } else {
+        if (K <= 32) launched = try_launch(__nv_bfloat16{}, 128, 32, 4);
+        if (!launched && K <= 64) launched = try_launch(__nv_bfloat16{}, 128, 64, 4);
+        if (!launched && K <= 32) launched = try_launch(__nv_bfloat16{}, 64, 32, 4);
+    }
+
+    if (!launched) {
+        // Caller must fall back. Return empty tensors as a sentinel.
+        return std::make_tuple(at::empty({0}, x.options().dtype(at::kFloat)),
+                               at::empty({0}, x.options().dtype(at::kFloat)));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return std::make_tuple(lse, resp);
 }
 
 }}}  // namespace gmmxx::estep::spherical

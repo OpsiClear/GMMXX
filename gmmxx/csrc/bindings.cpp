@@ -72,6 +72,23 @@ NB_MODULE(_C, m) {
         "torch ops in the soft-EM E-step prep block.");
 
     m.def(
+        "spherical_logsumexp_resp_sm80",
+        &gmmxx::estep::spherical::logsumexp_resp_sm80,
+        nb::arg("x"),
+        nb::arg("means"),
+        nb::arg("var"),
+        nb::arg("log_w"),
+        nb::arg("x_sq"),
+        nb::arg("c_sq"),
+        nb::arg("need_lse"),
+        "Exp62 fused E-step: returns (lse (B,N) or empty if !need_lse, "
+        "resp (B,N,K)) in one sm80 mma kernel launch — saves the "
+        "redundant GEMM that the separate logsumexp+resp pipeline runs. "
+        "Constraint: K must fit in one BLOCK_K of an available tile "
+        "(<=64 in current build); returns two empty tensors when no tile "
+        "fits, signalling the caller to fall back.");
+
+    m.def(
         "blocked_update_spherical",
         &gmmxx::mstep::spherical::blocked_update,
         nb::arg("x"),
