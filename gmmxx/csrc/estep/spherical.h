@@ -23,14 +23,18 @@ at::Tensor logsumexp(const at::Tensor& x,
                      const at::Tensor& means,
                      const at::Tensor& var,
                      const at::Tensor& log_w,
-                     c10::optional<at::Tensor> out);
+                     c10::optional<at::Tensor> out,
+                     c10::optional<at::Tensor> x_sq = c10::nullopt,
+                     c10::optional<at::Tensor> c_sq = c10::nullopt);
 
 at::Tensor resp(const at::Tensor& x,
                 const at::Tensor& means,
                 const at::Tensor& var,
                 const at::Tensor& log_w,
                 const at::Tensor& log_norm,
-                c10::optional<at::Tensor> out);
+                c10::optional<at::Tensor> out,
+                c10::optional<at::Tensor> x_sq = c10::nullopt,
+                c10::optional<at::Tensor> c_sq = c10::nullopt);
 
 // Safe-path implementations (renamed from Plan 2's public functions).
 at::Tensor assign_safe(const at::Tensor& x,

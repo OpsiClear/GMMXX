@@ -39,10 +39,20 @@ at::Tensor assign(const at::Tensor& x, const at::Tensor& means,
 
 at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
                      const at::Tensor& var, const at::Tensor& log_w,
-                     c10::optional<at::Tensor> out) {
+                     c10::optional<at::Tensor> out,
+                     c10::optional<at::Tensor> x_sq_opt,
+                     c10::optional<at::Tensor> c_sq_opt) {
     if (_can_use_sm80(x)) {
-        auto x_sq = x.to(at::kFloat).pow(2).sum(-1).contiguous();
-        auto c_sq = means.to(at::kFloat).pow(2).sum(-1).contiguous();
+        // Exp56: callers running the soft-EM loop can hoist x_sq/c_sq once per
+        // fit (x_sq) or once per iter (c_sq) and pass them in, avoiding the
+        // .to(float).pow(2).sum(-1) recompute that fires twice per iter
+        // (logsumexp + resp) on the sm80 path.
+        auto x_sq = x_sq_opt.has_value()
+            ? x_sq_opt.value()
+            : x.to(at::kFloat).pow(2).sum(-1).contiguous();
+        auto c_sq = c_sq_opt.has_value()
+            ? c_sq_opt.value()
+            : means.to(at::kFloat).pow(2).sum(-1).contiguous();
         return logsumexp_sm80(x, means, var, log_w, x_sq, c_sq, std::move(out));
     }
     return logsumexp_safe(x, means, var, log_w, std::move(out));
@@ -51,10 +61,16 @@ at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
 at::Tensor resp(const at::Tensor& x, const at::Tensor& means,
                 const at::Tensor& var, const at::Tensor& log_w,
                 const at::Tensor& log_norm,
-                c10::optional<at::Tensor> out) {
+                c10::optional<at::Tensor> out,
+                c10::optional<at::Tensor> x_sq_opt,
+                c10::optional<at::Tensor> c_sq_opt) {
     if (_can_use_sm80(x)) {
-        auto x_sq = x.to(at::kFloat).pow(2).sum(-1).contiguous();
-        auto c_sq = means.to(at::kFloat).pow(2).sum(-1).contiguous();
+        auto x_sq = x_sq_opt.has_value()
+            ? x_sq_opt.value()
+            : x.to(at::kFloat).pow(2).sum(-1).contiguous();
+        auto c_sq = c_sq_opt.has_value()
+            ? c_sq_opt.value()
+            : means.to(at::kFloat).pow(2).sum(-1).contiguous();
         return resp_sm80(x, means, var, log_w, x_sq, c_sq, log_norm, std::move(out));
     }
     return resp_safe(x, means, var, log_w, log_norm, std::move(out));

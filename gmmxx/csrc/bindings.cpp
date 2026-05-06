@@ -41,7 +41,11 @@ NB_MODULE(_C, m) {
         nb::arg("var"),
         nb::arg("log_w"),
         nb::arg("out") = nb::none(),
-        "Spherical E-step stable logsumexp over k. Returns fp32 (B,N).");
+        nb::arg("x_sq") = nb::none(),
+        nb::arg("c_sq") = nb::none(),
+        "Spherical E-step stable logsumexp over k. Returns fp32 (B,N). "
+        "Pass cached x_sq=(B,N) and/or c_sq=(B,K) fp32 to skip the "
+        "per-call .to(float).pow(2).sum(-1) recompute on the sm80 path.");
 
     m.def(
         "spherical_resp",
@@ -52,7 +56,10 @@ NB_MODULE(_C, m) {
         nb::arg("log_w"),
         nb::arg("log_norm"),
         nb::arg("out") = nb::none(),
-        "Spherical E-step responsibilities r_{n,k}. Returns fp32 (B,N,K).");
+        nb::arg("x_sq") = nb::none(),
+        nb::arg("c_sq") = nb::none(),
+        "Spherical E-step responsibilities r_{n,k}. Returns fp32 (B,N,K). "
+        "Pass cached x_sq/c_sq to skip the per-call recompute on the sm80 path.");
 
     m.def(
         "prepare_spherical_estep",

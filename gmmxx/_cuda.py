@@ -156,6 +156,8 @@ def spherical_logsumexp(
     var: torch.Tensor,
     log_w: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    x_sq: Optional[torch.Tensor] = None,
+    c_sq: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """E-step stable logsumexp over k. Returns fp32 (B, N)."""
     require_cuda()
@@ -170,7 +172,7 @@ def spherical_logsumexp(
             return out
         return lse
     try:
-        return _C.spherical_logsumexp(x, means, var, log_w, out)
+        return _C.spherical_logsumexp(x, means, var, log_w, out, x_sq, c_sq)
     except RuntimeError as exc:
         if _no_fallback():
             raise
@@ -184,6 +186,8 @@ def spherical_resp(
     log_w: torch.Tensor,
     log_norm: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    x_sq: Optional[torch.Tensor] = None,
+    c_sq: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """E-step responsibilities. Returns fp32 (B, N, K)."""
     require_cuda()
@@ -199,7 +203,7 @@ def spherical_resp(
             return out
         return r
     try:
-        return _C.spherical_resp(x, means, var, log_w, log_norm, out)
+        return _C.spherical_resp(x, means, var, log_w, log_norm, out, x_sq, c_sq)
     except RuntimeError as exc:
         if _no_fallback():
             raise
@@ -345,8 +349,22 @@ def soft_update_spherical(
                 lse = logits.logsumexp(dim=-1) if compute_lse else None
             # else: chunked path already produced sum_aug; resp / lse are None
         else:
-            lse = spherical_logsumexp(x, means, var, log_w)
-            resp = spherical_resp(x, means, var, log_w, lse)
+            # Exp56: cache x_sq (constant across the EM loop) and compute c_sq
+            # once locally so the dispatcher does not redo .to(float).pow(2).sum
+            # twice per iter (in logsumexp + in resp).
+            x_sq_for_kernel = x_sq.contiguous() if x_sq is not None else None
+            c_sq_for_kernel = (
+                means.float().pow(2).sum(-1).contiguous()
+                if means.is_contiguous() else None
+            )
+            lse = spherical_logsumexp(
+                x, means, var, log_w,
+                x_sq=x_sq_for_kernel, c_sq=c_sq_for_kernel,
+            )
+            resp = spherical_resp(
+                x, means, var, log_w, lse,
+                x_sq=x_sq_for_kernel, c_sq=c_sq_for_kernel,
+            )
             if not compute_lse:
                 lse = None
         ids = resp.argmax(dim=-1).to(torch.int32) if (resp is not None and compute_ids) else None
