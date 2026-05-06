@@ -1340,6 +1340,14 @@ at::Tensor assign_sm80(
                 x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
             return true;
         }
+        // Exp59: BLOCK_N=128, BLOCK_K=32, WARPS=4. Halves c_smem vs (128,64,4)
+        // when K<=32, raising max-CTAs-per-SM and shrinking the per-CTA SMEM
+        // footprint. For K=32 shapes the BK=64 tile wastes half its SMEM.
+        if (bn == 128 && bk == 32 && warps == 4) {
+            launch_assign_sm80_typed<T, 128, 32, 4>(
+                x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
+            return true;
+        }
         // Narrow tile: BLOCK_N=64, BLOCK_K=32, WARPS=4 (smaller SMEM footprint)
         if (bn == 64 && bk == 32 && warps == 4) {
             launch_assign_sm80_typed<T, 64, 32, 4>(
@@ -1349,13 +1357,27 @@ at::Tensor assign_sm80(
         return false;
     };
 
+    // Exp59: prefer (128, 32, 4) when K is small enough that BK=64 would be
+    // half-empty. Falls through to the legacy ladder otherwise.
     bool launched = false;
     if (x.scalar_type() == at::kHalf) {
-        launched = try_launch(__half{}, 128, 64, 4) ||
-                   try_launch(__half{}, 64,  32, 4);
+        if (K <= 32) {
+            launched = try_launch(__half{}, 128, 32, 4);
+        }
+        if (!launched) {
+            launched = try_launch(__half{}, 128, 64, 4) ||
+                       try_launch(__half{}, 128, 32, 4) ||
+                       try_launch(__half{}, 64,  32, 4);
+        }
     } else {
-        launched = try_launch(__nv_bfloat16{}, 128, 64, 4) ||
-                   try_launch(__nv_bfloat16{}, 64,  32, 4);
+        if (K <= 32) {
+            launched = try_launch(__nv_bfloat16{}, 128, 32, 4);
+        }
+        if (!launched) {
+            launched = try_launch(__nv_bfloat16{}, 128, 64, 4) ||
+                       try_launch(__nv_bfloat16{}, 128, 32, 4) ||
+                       try_launch(__nv_bfloat16{}, 64,  32, 4);
+        }
     }
 
     if (!launched) {
@@ -1417,6 +1439,12 @@ at::Tensor logsumexp_sm80(
                 x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
             return true;
         }
+        // Exp59: small-K-friendly tile (see assign_sm80 dispatch comment).
+        if (bn == 128 && bk == 32 && warps == 4) {
+            launch_logsumexp_sm80_typed<T, 128, 32, 4>(
+                x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
+            return true;
+        }
         if (bn == 64 && bk == 32 && warps == 4) {
             launch_logsumexp_sm80_typed<T, 64, 32, 4>(
                 x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
@@ -1427,11 +1455,23 @@ at::Tensor logsumexp_sm80(
 
     bool launched = false;
     if (x.scalar_type() == at::kHalf) {
-        launched = try_launch(__half{}, 128, 64, 4) ||
-                   try_launch(__half{}, 64,  32, 4);
+        if (K <= 32) {
+            launched = try_launch(__half{}, 128, 32, 4);
+        }
+        if (!launched) {
+            launched = try_launch(__half{}, 128, 64, 4) ||
+                       try_launch(__half{}, 128, 32, 4) ||
+                       try_launch(__half{}, 64,  32, 4);
+        }
     } else {
-        launched = try_launch(__nv_bfloat16{}, 128, 64, 4) ||
-                   try_launch(__nv_bfloat16{}, 64,  32, 4);
+        if (K <= 32) {
+            launched = try_launch(__nv_bfloat16{}, 128, 32, 4);
+        }
+        if (!launched) {
+            launched = try_launch(__nv_bfloat16{}, 128, 64, 4) ||
+                       try_launch(__nv_bfloat16{}, 128, 32, 4) ||
+                       try_launch(__nv_bfloat16{}, 64,  32, 4);
+        }
     }
 
     if (!launched) {
@@ -1498,6 +1538,13 @@ at::Tensor resp_sm80(
                 B, N, K, D, stream);
             return true;
         }
+        // Exp59: small-K-friendly tile (see assign_sm80 dispatch comment).
+        if (bn == 128 && bk == 32 && warps == 4) {
+            launch_resp_sm80_typed<T, 128, 32, 4>(
+                x, means, var, log_w, x_sq, c_sq, log_norm, result,
+                B, N, K, D, stream);
+            return true;
+        }
         if (bn == 64 && bk == 32 && warps == 4) {
             launch_resp_sm80_typed<T, 64, 32, 4>(
                 x, means, var, log_w, x_sq, c_sq, log_norm, result,
@@ -1509,11 +1556,23 @@ at::Tensor resp_sm80(
 
     bool launched = false;
     if (x.scalar_type() == at::kHalf) {
-        launched = try_launch(__half{}, 128, 64, 4) ||
-                   try_launch(__half{}, 64,  32, 4);
+        if (K <= 32) {
+            launched = try_launch(__half{}, 128, 32, 4);
+        }
+        if (!launched) {
+            launched = try_launch(__half{}, 128, 64, 4) ||
+                       try_launch(__half{}, 128, 32, 4) ||
+                       try_launch(__half{}, 64,  32, 4);
+        }
     } else {
-        launched = try_launch(__nv_bfloat16{}, 128, 64, 4) ||
-                   try_launch(__nv_bfloat16{}, 64,  32, 4);
+        if (K <= 32) {
+            launched = try_launch(__nv_bfloat16{}, 128, 32, 4);
+        }
+        if (!launched) {
+            launched = try_launch(__nv_bfloat16{}, 128, 64, 4) ||
+                       try_launch(__nv_bfloat16{}, 128, 32, 4) ||
+                       try_launch(__nv_bfloat16{}, 64,  32, 4);
+        }
     }
 
     if (!launched) {
