@@ -280,9 +280,13 @@ def soft_update_spherical(
                 )
                 if _use_chunked:
                     # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
-                    # Pick chunk so per-chunk (chunk*K*4) <= ~32 MB to fit in
-                    # L2 across softmax→bmm hop on Ada (72 MB L2).
-                    target_chunk_bytes = 32 * 1024 * 1024
+                    # Exp65: 16 MB target (was 32 MB pre-Exp64). With Exp64's
+                    # addmm bf16 epilogue collapsing the per-chunk E-step into
+                    # one cuBLAS call, the per-chunk launch overhead dropped
+                    # below the L2-pressure win from smaller chunks. Sweep on
+                    # D=128 K=64 N=524k fp32 had 16 MB best at 32.5 ms vs 34.8
+                    # ms at 32 MB and 40.3 ms at 64 MB.
+                    target_chunk_bytes = 16 * 1024 * 1024
                     chunk_size = max(65536, target_chunk_bytes // (K_dim * 4))
                     Dp2 = x_aug_cached.shape[2]
                     sum_aug_acc = torch.zeros(
