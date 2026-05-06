@@ -245,6 +245,7 @@ def soft_update_spherical(
         B, N, D = x.shape
         x_f = x_f_cached if x_f_cached is not None else x.float()
         x_sq = x_sq_cached if x_sq_cached is not None else x_f.square().sum(dim=-1)
+        ids = None
         if _use_torch_fastpath_spherical(x):
             # Inline cuBLAS GEMM + reductions. Build the per-row+per-cluster
             # logit via a SINGLE augmented GEMM:
@@ -273,9 +274,12 @@ def soft_update_spherical(
                 K_dim = means_f.shape[1]
                 _N_total = x_estep_aug_cached.shape[1]
                 _full_resp_mb = _N_total * K_dim * 4 / (1024 * 1024)
+                # Exp66: keep chunked path on the last iter too (when lse
+                # and/or ids are needed). Per-chunk lse_chunk and ids_chunk
+                # are written into pre-allocated (B,N) buffers so we still
+                # avoid materializing the full (B,N,K) resp tensor.
                 _use_chunked = (
                     B == 1 and x_aug_cached is not None
-                    and (not compute_lse) and (not compute_ids)
                     and _full_resp_mb >= 64
                 )
                 if _use_chunked:
@@ -292,6 +296,16 @@ def soft_update_spherical(
                     sum_aug_acc = torch.zeros(
                         (B, K_dim, Dp2), dtype=torch.float32, device=x.device
                     )
+                    lse_full = None
+                    ids_full = None
+                    if compute_lse:
+                        lse_full = torch.empty(
+                            (B, _N_total), dtype=torch.float32, device=x.device
+                        )
+                    if compute_ids:
+                        ids_full = torch.empty(
+                            (B, _N_total), dtype=torch.int32, device=x.device
+                        )
                     if x_estep_aug_bf16_cached is not None:
                         # Exp64: bf16 alpha + bf16 means_aug + addmm bf16 fuses
                         # the bias-add into the cuBLAS GEMM epilogue (single
@@ -313,6 +327,10 @@ def soft_update_spherical(
                                 x_estep_aug_cached[0, n_start:n_end],
                                 means_aug[0].transpose(-1, -2),
                             ).unsqueeze(0)
+                        if compute_lse:
+                            lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
+                        if compute_ids:
+                            ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
                         resp_chunk = torch.softmax(logits_chunk, dim=-1)
                         sum_aug_acc.add_(torch.bmm(
                             resp_chunk.transpose(1, 2),
@@ -323,7 +341,9 @@ def soft_update_spherical(
                     sum_aug = sum_aug_acc
                     resp = None
                     logits = None
-                    lse = None
+                    lse = lse_full
+                    if compute_ids:
+                        ids = ids_full
                 elif B == 1:
                     if x_estep_aug_bf16_cached is not None:
                         # Exp64: addmm bf16 fuses bias-add into cuBLAS epilogue.
@@ -398,7 +418,10 @@ def soft_update_spherical(
                 )
                 if not compute_lse:
                     lse = None
-        ids = resp.argmax(dim=-1).to(torch.int32) if (resp is not None and compute_ids) else None
+        # Exp66: when chunked branch already populated ids in-line (resp is
+        # None then), keep it. Otherwise compute argmax from resp now.
+        if resp is not None:
+            ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
         if x_aug_cached is not None and resp is None:
             # Chunked-streaming mode already produced sum_aug above.
             sum_x = sum_aug[..., :D]
