@@ -68,13 +68,11 @@ def _common_nvcc_flags() -> list[str]:
     ]
     if os.name == "nt":
         # CCCL in CUDA 13 requires the conforming MSVC preprocessor.
-        # /DNOMINMAX — prevent windows.h from defining min/max macros.
-        # /Usmall — rpcndr.h (pulled in by cuda_runtime.h on Windows) defines
-        #   `small` as `char`; ATen/c10 use `small` as a parameter name so
-        #   the substitution mangles e.g. `bool small` -> `bool char`.
-        #   Passing -Usmall via -Xcompiler undefines it at the MSVC level so it
-        #   never reaches ATen headers, regardless of include order.
-        flags += ["-Xcompiler=/Zc:preprocessor,/DNOMINMAX,/Usmall"]
+        # Keep this aligned with flash-kmeans-cuda: macro cleanup belongs in
+        # csrc/common/torch_cuda_includes.h. Passing extra comma-separated MSVC
+        # options through nvcc can make CUDA 13.x spend minutes in frontend
+        # compilation before producing diagnostics.
+        flags += ["-Xcompiler=/Zc:preprocessor"]
     else:
         flags.append("-Xcompiler=-fPIC")
     return flags
@@ -126,6 +124,7 @@ def _build_extension():
         str(CSRC / "mstep" / "blocked_diag_sorted.cu"),
         str(CSRC / "mstep" / "finalize_diag.cu"),
         str(CSRC / "fused" / "spherical_fused.cu"),
+        str(CSRC / "em" / "spherical_em.cu"),
         str(nb_combined),
     ]
     include_dirs = [
@@ -135,6 +134,7 @@ def _build_extension():
         str(CSRC / "estep"),
         str(CSRC / "mstep"),
         str(CSRC / "fused"),
+        str(CSRC / "em"),
         nb_include,
         str(nb_robin_include),
     ]
