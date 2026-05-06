@@ -367,18 +367,20 @@ def soft_update_spherical(
             nk = resp.sum(dim=1)
             sum_x = torch.bmm(resp.transpose(1, 2), x_f)
             sum_x_sq = (resp * x_sq.unsqueeze(-1)).sum(dim=1)
-        # Finalize. When inputs are fp32 (the cuBLAS fastpath), use the
-        # custom CUDA kernel `finalize_spherical_soft` which fuses the
-        # ~12 small (B,K) torch ops into a single launch. Otherwise fall
-        # back to the eager torch path (handles dtype conversion).
-        if sum_x.dtype == torch.float32 and x.dtype == torch.float32 \
-                and means.is_contiguous() and var.is_contiguous():
+        # Finalize. The fused CUDA kernel takes fp32 sums/sumsq/nk (which the
+        # bmm M-step always produces) and emits fp32 means/var/weights in one
+        # launch — replacing ~12 small (B,K) torch ops. For fp16/bf16 input
+        # we cast means_new back after the kernel; that's still cheaper than
+        # the eager small-op chain. Exp55.
+        if sum_x.dtype == torch.float32 and means.is_contiguous() and var.is_contiguous():
             sum_x_c = sum_x.contiguous()
             sum_x_sq_c = sum_x_sq.contiguous()
             nk_c = nk.contiguous()
             means_new, var_new, weights, _log_w_unused = _C.finalize_spherical_soft(
                 sum_x_c, sum_x_sq_c, nk_c, int(N), float(reg_covar),
             )
+            if x.dtype != torch.float32:
+                means_new = means_new.to(x.dtype)
         else:
             nk_safe = nk.clamp_min(1e-8)
             active_mask = nk > 1e-8
