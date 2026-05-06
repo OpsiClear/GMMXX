@@ -289,15 +289,20 @@ def soft_update_spherical(
                         (B, K_dim, Dp2), dtype=torch.float32, device=x.device
                     )
                     if x_estep_aug_bf16_cached is not None:
-                        means_aug_bf16 = means_aug[0].to(torch.bfloat16)
+                        # Exp64: bf16 alpha + bf16 means_aug + addmm bf16 fuses
+                        # the bias-add into the cuBLAS GEMM epilogue (single
+                        # kernel, fp32 accumulation internal). This is ~3x
+                        # faster than mm(bf16)+cast+add separately on Ada.
+                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2)
+                        alpha_bf16 = alpha[0].to(torch.bfloat16)
                     for n_start in range(0, _N_total, chunk_size):
                         n_end = min(n_start + chunk_size, _N_total)
                         if x_estep_aug_bf16_cached is not None:
-                            cross_chunk = torch.mm(
+                            logits_chunk = torch.addmm(
+                                alpha_bf16,
                                 x_estep_aug_bf16_cached[0, n_start:n_end],
-                                means_aug_bf16.transpose(-1, -2),
-                            ).float()
-                            logits_chunk = (alpha[0] + cross_chunk).unsqueeze(0)
+                                means_aug_bf16_t,
+                            ).float().unsqueeze(0)
                         else:
                             logits_chunk = torch.addmm(
                                 alpha[0],
@@ -317,12 +322,14 @@ def soft_update_spherical(
                     lse = None
                 elif B == 1:
                     if x_estep_aug_bf16_cached is not None:
-                        means_aug_bf16 = means_aug[0].to(torch.bfloat16)
-                        cross = torch.mm(
+                        # Exp64: addmm bf16 fuses bias-add into cuBLAS epilogue.
+                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2)
+                        alpha_bf16 = alpha[0].to(torch.bfloat16)
+                        logits = torch.addmm(
+                            alpha_bf16,
                             x_estep_aug_bf16_cached[0],
-                            means_aug_bf16.transpose(-1, -2),
-                        ).float()
-                        logits = (alpha[0] + cross).unsqueeze(0)
+                            means_aug_bf16_t,
+                        ).float().unsqueeze(0)
                     else:
                         logits = torch.addmm(
                             alpha[0],
