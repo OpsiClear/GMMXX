@@ -332,10 +332,15 @@ def soft_update_spherical(
                         if compute_ids:
                             ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
                         resp_chunk = torch.softmax(logits_chunk, dim=-1)
-                        sum_aug_acc.add_(torch.bmm(
+                        # Exp67: baddbmm fuses bmm + add into the cuBLAS GEMM
+                        # beta-epilogue (single launch). out=sum_aug_acc keeps
+                        # the accumulator in-place across iterations.
+                        torch.baddbmm(
+                            sum_aug_acc,
                             resp_chunk.transpose(1, 2),
                             x_aug_cached[:, n_start:n_end],
-                        ))
+                            out=sum_aug_acc,
+                        )
                     # Mark for downstream branch; resp / logits not materialized
                     # globally in chunked mode.
                     sum_aug = sum_aug_acc
