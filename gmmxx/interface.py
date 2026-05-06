@@ -540,13 +540,13 @@ class GMMXX:
             x_aug_cached = torch.cat(
                 [x_f_cached, x_sq_cached.unsqueeze(-1), ones_col], dim=-1
             ).contiguous()
-            # E-step augmented input: (B, N, D+1) = [x_f | x_sq]. With
-            # appropriately-scaled means_aug (B, K, D+1) per iter, a single
-            # GEMM produces inv_var*(cross - 0.5*|x|^2), eliminating one
-            # (B,N,K) elementwise pass per iter.
-            x_estep_aug_cached = torch.cat(
-                [x_f_cached, x_sq_cached.unsqueeze(-1)], dim=-1
-            ).contiguous()
+            # E-step augmented input: (B, N, D+1) = [x_f | x_sq]. The first
+            # D+1 cols of x_aug are exactly [x_f | x_sq], so we can take a
+            # strided slice of x_aug instead of building a second N*(D+1)*4
+            # tensor. Exp68 saves ~270 MB write at fit setup for the D=128
+            # bench shape and a corresponding cat launch. cuBLAS GEMM on a
+            # strided 2D tensor (lda = D+2, cols = D+1) is equally fast.
+            x_estep_aug_cached = x_aug_cached[:, :, :-1]
             # For D >= 64, the E-step GEMM is bandwidth-bound at fp32. Pre-
             # cast a bf16 copy; cuBLAS HMMA with fp32 accumulator halves
             # the input BW and uses bf16 tensor cores (2x throughput vs TF32).
