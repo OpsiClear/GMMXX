@@ -341,7 +341,7 @@ def soft_update_spherical(
                                 alpha_bf16,
                                 x_aug_cached[0],
                                 NUM_CTAS=128,
-                                BLOCK_N=32, BLOCK_D1=32, BLOCK_D2=64,
+                                BLOCK_N=32, BLOCK_D1=64, BLOCK_D2=64,
                             ).unsqueeze(0)
                             _persistent_taken = True
                         except Exception:
