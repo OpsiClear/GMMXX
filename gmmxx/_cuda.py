@@ -322,12 +322,38 @@ def soft_update_spherical(
                         # faster than mm(bf16)+cast+add separately on Ada.
                         means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2).contiguous()
                         alpha_bf16 = alpha[0].to(torch.bfloat16).contiguous()
+
+                    # Exp78: persistent-CTA Triton kernel — processes the full
+                    # N range in one launch with a per-CTA partial accumulator
+                    # held across BLOCK_N tiles, then reduces 128 partials.
+                    # Bypasses the chunked Python loop entirely.
+                    _persistent_taken = False
+                    if (
+                        x_estep_aug_bf16_cached is not None
+                        and not compute_lse and not compute_ids
+                        and _N_total >= 65536
+                    ):
+                        try:
+                            from .persistent_em_chunk_triton import persistent_em_iter
+                            sum_aug_acc = persistent_em_iter(
+                                x_estep_aug_bf16_cached[0],
+                                means_aug_bf16_t,
+                                alpha_bf16,
+                                x_aug_cached[0],
+                                NUM_CTAS=128,
+                                BLOCK_N=32, BLOCK_D1=32, BLOCK_D2=64,
+                            ).unsqueeze(0)
+                            _persistent_taken = True
+                        except Exception:
+                            _persistent_taken = False
+
                     # Exp70: Triton kernel fuses the per-chunk bf16 GEMM with
                     # softmax, skipping the (chunk_n, K) fp32 logits write.
                     # Only the no-lse / no-ids fast path uses it; lse/ids
                     # iters need the materialized logits.
                     _use_triton_fused_estep = (
-                        x_estep_aug_bf16_cached is not None
+                        not _persistent_taken
+                        and x_estep_aug_bf16_cached is not None
                         and not compute_lse
                         and not compute_ids
                     )
@@ -337,7 +363,12 @@ def soft_update_spherical(
                         except ImportError:
                             _use_triton_fused_estep = False
                     _first_chunk = True
-                    for n_start in range(0, _N_total, chunk_size):
+                    _chunk_iter_range = (
+                        range(0)  # empty: persistent path already filled sum_aug_acc
+                        if _persistent_taken
+                        else range(0, _N_total, chunk_size)
+                    )
+                    for n_start in _chunk_iter_range:
                         n_end = min(n_start + chunk_size, _N_total)
                         if _use_triton_fused_estep:
                             resp_chunk = addmm_softmax_chunk(
