@@ -161,6 +161,6 @@ def persistent_em_iter(
         BLOCK_D2=BLOCK_D2,
         X_AUG_IS_BF16=(x_aug.dtype == torch.bfloat16),
         num_warps=4,
-        num_stages=2,
+        num_stages=4,
     )
     return partial_buffer.sum(dim=0)
