@@ -80,7 +80,7 @@ def addmm_softmax_chunk(
     alpha_bf16: torch.Tensor,       # (K,) bf16
     *,
     BLOCK_N: int = 64,
-    BLOCK_D: int = 32,
+    BLOCK_D: int = 64,
 ) -> torch.Tensor:
     """Returns resp (1, cn, K) fp32 = softmax(x @ means_t + alpha)."""
     assert x_chunk_bf16.is_cuda and x_chunk_bf16.dtype == torch.bfloat16
