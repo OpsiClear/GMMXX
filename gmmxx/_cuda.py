@@ -299,7 +299,10 @@ def soft_update_spherical(
                     target_chunk_bytes = 16 * 1024 * 1024
                     chunk_size = max(65536, target_chunk_bytes // (K_dim * 4))
                     Dp2 = x_aug_cached.shape[2]
-                    sum_aug_acc = torch.zeros(
+                    # Exp77: torch.empty + first-chunk beta=0 skip the
+                    # zero-write kernel (~2 μs/iter) — baddbmm with beta=0
+                    # ignores the input tensor entirely on the first chunk.
+                    sum_aug_acc = torch.empty(
                         (B, K_dim, Dp2), dtype=torch.float32, device=x.device
                     )
                     lse_full = None
@@ -333,6 +336,7 @@ def soft_update_spherical(
                             from .addmm_softmax_chunk_triton import addmm_softmax_chunk
                         except ImportError:
                             _use_triton_fused_estep = False
+                    _first_chunk = True
                     for n_start in range(0, _N_total, chunk_size):
                         n_end = min(n_start + chunk_size, _N_total)
                         if _use_triton_fused_estep:
@@ -359,15 +363,18 @@ def soft_update_spherical(
                             if compute_ids:
                                 ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
                             resp_chunk = torch.softmax(logits_chunk, dim=-1)
-                        # Exp67: baddbmm fuses bmm + add into the cuBLAS GEMM
-                        # beta-epilogue (single launch). out=sum_aug_acc keeps
-                        # the accumulator in-place across iterations.
+                        # Exp67/77: baddbmm fuses bmm + add into the cuBLAS GEMM
+                        # beta-epilogue. First chunk uses beta=0 so the
+                        # uninitialized sum_aug_acc is overwritten without
+                        # requiring a separate zero_() call.
                         torch.baddbmm(
                             sum_aug_acc,
                             resp_chunk.transpose(1, 2),
                             x_aug_cached[:, n_start:n_end],
+                            beta=0.0 if _first_chunk else 1.0,
                             out=sum_aug_acc,
                         )
+                        _first_chunk = False
                     # Mark for downstream branch; resp / logits not materialized
                     # globally in chunked mode.
                     sum_aug = sum_aug_acc
