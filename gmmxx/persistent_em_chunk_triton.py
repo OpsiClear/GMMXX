@@ -42,6 +42,7 @@ def _persistent_em_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D1: tl.constexpr,
     BLOCK_D2: tl.constexpr,
+    X_AUG_IS_BF16: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_d2 = tl.program_id(1)
@@ -95,12 +96,16 @@ def _persistent_em_kernel(
         resp = tl.where(n_mask[:, None] & k_mask[None, :], resp, 0.0)
 
         # Stage 3: partial += resp.T @ x_aug_tile.
+        # Use bf16 x_aug + bf16 resp via tl.dot (HMMA, fp32 acc).
         xa = tl.load(
             x_aug_ptr + offs_n[:, None] * stride_xa_n + offs_d2[None, :] * stride_xa_d,
             mask=n_mask[:, None] & d2_mask[None, :],
             other=0.0,
         )
-        partial += tl.dot(tl.trans(resp), xa)
+        if X_AUG_IS_BF16:
+            partial += tl.dot(tl.trans(resp).to(tl.bfloat16), xa)
+        else:
+            partial += tl.dot(tl.trans(resp), xa)
 
         n_tile += BLOCK_N
 
@@ -154,6 +159,7 @@ def persistent_em_iter(
         BLOCK_K=BLOCK_K,
         BLOCK_D1=BLOCK_D1,
         BLOCK_D2=BLOCK_D2,
+        X_AUG_IS_BF16=(x_aug.dtype == torch.bfloat16),
         num_warps=4,
         num_stages=2,
     )

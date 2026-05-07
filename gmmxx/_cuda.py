@@ -221,6 +221,7 @@ def soft_update_spherical(
     x_aug_cached: Optional[torch.Tensor] = None,
     x_estep_aug_cached: Optional[torch.Tensor] = None,
     x_estep_aug_bf16_cached: Optional[torch.Tensor] = None,
+    x_aug_bf16_cached: Optional[torch.Tensor] = None,
     compute_ids: bool = True,
     compute_lse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -335,11 +336,19 @@ def soft_update_spherical(
                     ):
                         try:
                             from .persistent_em_chunk_triton import persistent_em_iter
+                            # Exp80: pass bf16 x_aug when available — the
+                            # kernel uses tl.dot(bf16, bf16) with fp32
+                            # accumulator, halving x_aug read BW.
+                            _x_aug_for_kernel = (
+                                x_aug_bf16_cached[0]
+                                if x_aug_bf16_cached is not None
+                                else x_aug_cached[0]
+                            )
                             sum_aug_acc = persistent_em_iter(
                                 x_estep_aug_bf16_cached[0],
                                 means_aug_bf16_t,
                                 alpha_bf16,
-                                x_aug_cached[0],
+                                _x_aug_for_kernel,
                                 NUM_CTAS=128,
                                 BLOCK_N=32, BLOCK_D1=64, BLOCK_D2=64,
                             ).unsqueeze(0)

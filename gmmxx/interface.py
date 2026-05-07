@@ -527,6 +527,7 @@ class GMMXX:
         x_aug_cached: Optional[torch.Tensor] = None
         x_estep_aug_cached: Optional[torch.Tensor] = None
         x_estep_aug_bf16_cached: Optional[torch.Tensor] = None
+        x_aug_bf16_cached: Optional[torch.Tensor] = None
         if use_soft_update:
             x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
             x_sq_cached = x_f_cached.square().sum(dim=-1)
@@ -554,6 +555,13 @@ class GMMXX:
                 x_estep_aug_bf16_cached = (
                     x_estep_aug_cached.to(torch.bfloat16).contiguous()
                 )
+                # Exp80: also pre-cast the (B, N, D+2) x_aug as bf16 for the
+                # persistent-CTA Triton kernel's M-step partial GEMM. The
+                # kernel does tl.dot(bf16, bf16) with fp32 accumulator,
+                # halving the x_aug read BW vs fp32 (276 MB -> 138 MB at the
+                # D=128 bench shape). End-to-end persistent-kernel time
+                # 0.95 ms -> 0.46 ms (2x).
+                x_aug_bf16_cached = x_aug_cached.to(torch.bfloat16).contiguous()
 
         # Hoist hot-path attribute and module-attribute lookups out of
         # the Python loop. The interpreter's name resolution per iter on
@@ -592,6 +600,7 @@ class GMMXX:
                     x_aug_cached=x_aug_cached,
                     x_estep_aug_cached=x_estep_aug_cached,
                     x_estep_aug_bf16_cached=x_estep_aug_bf16_cached,
+                    x_aug_bf16_cached=x_aug_bf16_cached,
                     compute_ids=is_last,
                     compute_lse=_need_lse,
                 )
