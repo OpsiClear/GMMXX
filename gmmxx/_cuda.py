@@ -311,27 +311,48 @@ def soft_update_spherical(
                         # the bias-add into the cuBLAS GEMM epilogue (single
                         # kernel, fp32 accumulation internal). This is ~3x
                         # faster than mm(bf16)+cast+add separately on Ada.
-                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2)
-                        alpha_bf16 = alpha[0].to(torch.bfloat16)
+                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2).contiguous()
+                        alpha_bf16 = alpha[0].to(torch.bfloat16).contiguous()
+                    # Exp70: Triton kernel fuses the per-chunk bf16 GEMM with
+                    # softmax, skipping the (chunk_n, K) fp32 logits write.
+                    # Only the no-lse / no-ids fast path uses it; lse/ids
+                    # iters need the materialized logits.
+                    _use_triton_fused_estep = (
+                        x_estep_aug_bf16_cached is not None
+                        and not compute_lse
+                        and not compute_ids
+                    )
+                    if _use_triton_fused_estep:
+                        try:
+                            from .addmm_softmax_chunk_triton import addmm_softmax_chunk
+                        except ImportError:
+                            _use_triton_fused_estep = False
                     for n_start in range(0, _N_total, chunk_size):
                         n_end = min(n_start + chunk_size, _N_total)
-                        if x_estep_aug_bf16_cached is not None:
-                            logits_chunk = torch.addmm(
-                                alpha_bf16,
+                        if _use_triton_fused_estep:
+                            resp_chunk = addmm_softmax_chunk(
                                 x_estep_aug_bf16_cached[0, n_start:n_end],
                                 means_aug_bf16_t,
-                            ).float().unsqueeze(0)
+                                alpha_bf16,
+                            )
                         else:
-                            logits_chunk = torch.addmm(
-                                alpha[0],
-                                x_estep_aug_cached[0, n_start:n_end],
-                                means_aug[0].transpose(-1, -2),
-                            ).unsqueeze(0)
-                        if compute_lse:
-                            lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
-                        if compute_ids:
-                            ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
-                        resp_chunk = torch.softmax(logits_chunk, dim=-1)
+                            if x_estep_aug_bf16_cached is not None:
+                                logits_chunk = torch.addmm(
+                                    alpha_bf16,
+                                    x_estep_aug_bf16_cached[0, n_start:n_end],
+                                    means_aug_bf16_t,
+                                ).float().unsqueeze(0)
+                            else:
+                                logits_chunk = torch.addmm(
+                                    alpha[0],
+                                    x_estep_aug_cached[0, n_start:n_end],
+                                    means_aug[0].transpose(-1, -2),
+                                ).unsqueeze(0)
+                            if compute_lse:
+                                lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
+                            if compute_ids:
+                                ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
+                            resp_chunk = torch.softmax(logits_chunk, dim=-1)
                         # Exp67: baddbmm fuses bmm + add into the cuBLAS GEMM
                         # beta-epilogue (single launch). out=sum_aug_acc keeps
                         # the accumulator in-place across iterations.
