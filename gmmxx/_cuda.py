@@ -278,9 +278,15 @@ def soft_update_spherical(
                 # and/or ids are needed). Per-chunk lse_chunk and ids_chunk
                 # are written into pre-allocated (B,N) buffers so we still
                 # avoid materializing the full (B,N,K) resp tensor.
+                # Exp71: lower the chunked threshold to 8 MB so even small-
+                # N cells (small grid D=128 K=64 N=65k = 16 MB) hit the
+                # chunked path, which now uses Exp70's Triton fused
+                # addmm+softmax. The non-chunked branch is left for shapes
+                # that fit in a single chunk anyway (chunk_size will equal
+                # _N_total).
                 _use_chunked = (
                     B == 1 and x_aug_cached is not None
-                    and _full_resp_mb >= 64
+                    and _full_resp_mb >= 8
                 )
                 if _use_chunked:
                     # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
