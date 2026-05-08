@@ -243,6 +243,12 @@ python benchmarks\benchmark_gmm.py --dataset blobs --n-samples 65536 --n-feature
 
 # Flash-kmeans-sized shape sweep across covariance modes
 python benchmarks\benchmark_flash_kmeans_sizes.py --shapes tiny,small,med,big,huge,mega --covariances all --backends cuda,torch --max-iter 1
+
+# vs scikit-learn baseline (markdown table for README / reports)
+python benchmarks\bench_vs_sklearn.py --grid default --max-iter 20 --n-repeat 3
+
+# gmmxx-only at larger shapes sklearn cannot reasonably handle
+python benchmarks\bench_gmmxx_scale.py --max-iter 20 --n-repeat 3
 ```
 
 Low-level Triton module benchmark:
@@ -276,6 +282,43 @@ python -m pip install torchgmm tgmm
 ```
 
 More implementation references are collected in [docs/high_performance_gmm_references.md](docs/high_performance_gmm_references.md).
+
+### vs scikit-learn baseline
+
+`scikit-learn`'s `GaussianMixture` is the canonical CPU baseline. Reproduce the table with:
+
+```powershell
+python benchmarks\bench_vs_sklearn.py --grid default --max-iter 20 --n-repeat 3
+```
+
+Measured on RTX 4090, Python 3.12, `torch 2.11.0+cu130`, `sklearn 1.8.0`, 20 EM iterations, median of 3 runs after 3 warmup fits. sklearn uses `init_params='random'` (or `kmeans` for full-cov to avoid singular covariance) with `n_init=1` and matched `reg_covar`.
+
+| cov | N | D | K | dtype | sklearn | gmmxx (cuda) | speedup | backend |
+|---|---|---|---|---|---|---|---|---|
+| spherical | N= 16,384 | D= 32 | K=  64 | fp16 |    1609 ms |       4 ms | **360x** | cuda |
+| spherical | N= 65,536 | D= 32 | K=  64 | fp16 |    6209 ms |       4 ms | **1380x** | cuda |
+| spherical | N=131,072 | D=128 | K=  64 | fp32 |   14117 ms |       9 ms | **1656x** | cuda |
+| spherical | N=131,072 | D= 16 | K=  32 | fp16 |    5863 ms |       9 ms | **641x** | cuda |
+| diag | N= 16,384 | D= 32 | K=  64 | fp32 |    1381 ms |      97 ms | **14x** | cuda |
+| diag | N= 65,536 | D= 32 | K=  64 | fp32 |    5502 ms |     103 ms | **53x** | cuda |
+| tied | N= 16,384 | D= 32 | K=  64 | fp32 |    8332 ms |      83 ms | **101x** | cuda |
+| tied | N= 65,536 | D= 32 | K=  64 | fp32 |   33094 ms |      85 ms | **391x** | cuda |
+| full | N= 16,384 | D= 16 | K=  32 | fp32 |    5824 ms |      54 ms | **107x** | cuda |
+| full | N= 65,536 | D= 16 | K=  32 | fp32 |   19893 ms |     193 ms | **103x** | cuda |
+
+The `default` grid is sized so each sklearn fit completes in under ~60 seconds. At larger shapes — the kind a CUDA backend is built for — sklearn fits become impractical (minutes per iter). gmmxx's wall clock at those shapes:
+
+```powershell
+python benchmarks\bench_gmmxx_scale.py --max-iter 20 --n-repeat 3
+```
+
+| cov | N | D | K | dtype | gmmxx (cuda) | backend |
+|---|---|---|---|---|---|---|
+| spherical | N=  524,288 | D=128 | K=  64 | fp32 |      18 ms | cuda |
+| spherical | N=1,048,576 | D= 32 | K=  64 | fp16 |      32 ms | cuda |
+| spherical | N=4,194,304 | D= 16 | K=  32 | fp16 |      59 ms | cuda |
+| diag | N=  524,288 | D=128 | K= 128 | fp16 |     222 ms | cuda |
+| tied | N=  524,288 | D= 64 | K= 128 | fp16 |     210 ms | cuda |
 
 ### Local RTX 4090 Notes
 
