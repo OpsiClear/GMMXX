@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any, Optional
 
+import contextlib
 import os
 
 import torch
@@ -281,14 +282,14 @@ class GMMXX:
             return False
         return self.backend in {"auto", "triton"}
 
-    def _apply_matmul_precision(self) -> None:
+    def _apply_matmul_precision(self):
         """Apply matmul_precision globally for the duration of one call.
 
         Returns the previous setting so the caller can restore it. We
         deliberately do not leak the change across calls — earlier
         behavior left torch.get_float32_matmul_precision() perturbed
-        after fit(), corrupting downstream tests that rely on
-        full-precision fp32 matmul.
+        after fit() / predict(), corrupting downstream code that relies
+        on full-precision fp32 matmul.
         """
         if self.matmul_precision is None:
             return None
@@ -300,6 +301,18 @@ class GMMXX:
     def _restore_matmul_precision(prev) -> None:
         if prev is not None:
             torch.set_float32_matmul_precision(prev)
+
+    @contextlib.contextmanager
+    def _matmul_precision_scope(self):
+        """Context manager that applies self.matmul_precision for the
+        wrapped block and restores the prior value on exit. Used by
+        train() and predict-side methods so the global setting does not
+        leak past the call."""
+        prev = self._apply_matmul_precision()
+        try:
+            yield
+        finally:
+            self._restore_matmul_precision(prev)
 
     def _invalidate_inference_caches(self) -> None:
         self._diag_inference_cache = None
@@ -580,6 +593,39 @@ class GMMXX:
         )
         self.last_backend_used_ = "cuda"
         self.cuda_estep_enabled_ = True
+
+    def _run_streamed_cuda_tensor_fit(
+        self,
+        covariance_type: str,
+        torch_native_fn,
+        x_b: torch.Tensor,
+        batch_size: Optional[int],
+    ) -> None:
+        """Run a fit through the streamed CUDA-tensor path for the given
+        covariance type. Common body for the diag/tied/full dispatch
+        branches in train()."""
+        chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes(
+            covariance_type, x_b
+        )
+        labels_b, means_b, variances_b, weights_b, info = torch_native_fn(
+            x_b, self.k,
+            max_iters=self.niter, tol=self.tol, verbose=self.verbose,
+            init_params=self.init_params, reg_covar=self.reg_covar,
+            chunk_size_N=chunk_n, chunk_size_K=chunk_k,
+            kmeans_init_iters=self.init_kmeans_iters,
+            kmeans_init_tol=self.init_kmeans_tol,
+            kmeans_use_triton=self.use_triton,
+            gmm_use_triton="auto" if self.use_triton else False,
+            compute_labels=self.compute_labels_on_fit,
+            approx_top_k=self.approx_top_k,
+        )
+        self._set_cuda_tensor_streamed_result(
+            labels_b=labels_b, means_b=means_b,
+            variances_b=variances_b, weights_b=weights_b,
+            info=info, batch_size=batch_size,
+            chunk_size_n=chunk_n, chunk_size_k=chunk_k,
+            n_iter=int(info.get("n_iter", self.niter)),
+        )
 
     def _train_spherical_cuda(self, x_b: torch.Tensor, batch_size: Optional[int]) -> None:
         """Spherical EM loop on the CUDA backend (Plan 2 safe path).
@@ -1092,11 +1138,8 @@ class GMMXX:
         )
 
     def train(self, data: torch.Tensor):
-        prev_matmul_prec = self._apply_matmul_precision()
-        try:
+        with self._matmul_precision_scope():
             return self._train_impl(data)
-        finally:
-            self._restore_matmul_precision(prev_matmul_prec)
 
     def _train_impl(self, data: torch.Tensor):
         self._reset_fit_state()
@@ -1161,27 +1204,8 @@ class GMMXX:
             # on a CUDA tensor and report the fit as backend='cuda' /
             # cuda_tensor_streamed_enabled.
             if self._can_use_cuda_tensor_streamed_fit("diag", x_b):
-                chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes("diag", x_b)
-                labels_b, means_b, variances_b, weights_b, info = (
-                    batch_gmm_Diagonal_torch_native(
-                        x_b, self.k,
-                        max_iters=self.niter, tol=self.tol, verbose=self.verbose,
-                        init_params=self.init_params, reg_covar=self.reg_covar,
-                        chunk_size_N=chunk_n, chunk_size_K=chunk_k,
-                        kmeans_init_iters=self.init_kmeans_iters,
-                        kmeans_init_tol=self.init_kmeans_tol,
-                        kmeans_use_triton=self.use_triton,
-                        gmm_use_triton="auto" if self.use_triton else False,
-                        compute_labels=self.compute_labels_on_fit,
-                        approx_top_k=self.approx_top_k,
-                    )
-                )
-                self._set_cuda_tensor_streamed_result(
-                    labels_b=labels_b, means_b=means_b,
-                    variances_b=variances_b, weights_b=weights_b,
-                    info=info, batch_size=batch_size,
-                    chunk_size_n=chunk_n, chunk_size_k=chunk_k,
-                    n_iter=int(info.get("n_iter", self.niter)),
+                self._run_streamed_cuda_tensor_fit(
+                    "diag", batch_gmm_Diagonal_torch_native, x_b, batch_size
                 )
                 return
             # CUDA backend dispatch — when resolver picks "cuda", run the
@@ -1231,27 +1255,8 @@ class GMMXX:
         elif self.covariance_type == "tied":
             # Streamed CUDA-tensor dispatch (see diag branch comment above).
             if self._can_use_cuda_tensor_streamed_fit("tied", x_b):
-                chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes("tied", x_b)
-                labels_b, means_b, variances_b, weights_b, info = (
-                    batch_gmm_Tied_torch_native(
-                        x_b, self.k,
-                        max_iters=self.niter, tol=self.tol, verbose=self.verbose,
-                        init_params=self.init_params, reg_covar=self.reg_covar,
-                        chunk_size_N=chunk_n, chunk_size_K=chunk_k,
-                        kmeans_init_iters=self.init_kmeans_iters,
-                        kmeans_init_tol=self.init_kmeans_tol,
-                        kmeans_use_triton=self.use_triton,
-                        gmm_use_triton="auto" if self.use_triton else False,
-                        compute_labels=self.compute_labels_on_fit,
-                        approx_top_k=self.approx_top_k,
-                    )
-                )
-                self._set_cuda_tensor_streamed_result(
-                    labels_b=labels_b, means_b=means_b,
-                    variances_b=variances_b, weights_b=weights_b,
-                    info=info, batch_size=batch_size,
-                    chunk_size_n=chunk_n, chunk_size_k=chunk_k,
-                    n_iter=int(info.get("n_iter", self.niter)),
+                self._run_streamed_cuda_tensor_fit(
+                    "tied", batch_gmm_Tied_torch_native, x_b, batch_size
                 )
                 return
             # CUDA backend dispatch — when resolver picks "cuda", run the
@@ -1301,27 +1306,8 @@ class GMMXX:
             # covariance_type == "full"
             # Streamed CUDA-tensor dispatch (see diag branch comment above).
             if self._can_use_cuda_tensor_streamed_fit("full", x_b):
-                chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes("full", x_b)
-                labels_b, means_b, variances_b, weights_b, info = (
-                    batch_gmm_Full_torch_native(
-                        x_b, self.k,
-                        max_iters=self.niter, tol=self.tol, verbose=self.verbose,
-                        init_params=self.init_params, reg_covar=self.reg_covar,
-                        chunk_size_N=chunk_n, chunk_size_K=chunk_k,
-                        kmeans_init_iters=self.init_kmeans_iters,
-                        kmeans_init_tol=self.init_kmeans_tol,
-                        kmeans_use_triton=self.use_triton,
-                        gmm_use_triton="auto" if self.use_triton else False,
-                        compute_labels=self.compute_labels_on_fit,
-                        approx_top_k=self.approx_top_k,
-                    )
-                )
-                self._set_cuda_tensor_streamed_result(
-                    labels_b=labels_b, means_b=means_b,
-                    variances_b=variances_b, weights_b=weights_b,
-                    info=info, batch_size=batch_size,
-                    chunk_size_n=chunk_n, chunk_size_k=chunk_k,
-                    n_iter=int(info.get("n_iter", self.niter)),
+                self._run_streamed_cuda_tensor_fit(
+                    "full", batch_gmm_Full_torch_native, x_b, batch_size
                 )
                 return
             # CUDA backend dispatch — when resolver picks "cuda", run the
@@ -1484,7 +1470,10 @@ class GMMXX:
             raise RuntimeError("Model not trained. Call train() or fit() first.")
 
     def _prepare_predict_input(self, data: torch.Tensor) -> tuple[torch.Tensor, Optional[int]]:
-        self._apply_matmul_precision()
+        # matmul_precision is applied via _matmul_precision_scope at the
+        # public predict-side methods (predict / predict_proba /
+        # score_samples / score), not here, so the global setting does
+        # not leak past the call.
         self._require_trained()
         x_b, batch_size = self._normalize_input(data)
         if batch_size != self._batch_size:
@@ -1625,6 +1614,10 @@ class GMMXX:
         return self._full_inference_cache
 
     def predict(self, data: torch.Tensor) -> torch.LongTensor:
+        with self._matmul_precision_scope():
+            return self._predict_impl(data)
+
+    def _predict_impl(self, data: torch.Tensor) -> torch.LongTensor:
         x_b, batch_size = self._prepare_predict_input(data)
         if self._is_large_cpu_stream_input(x_b):
             labels_b, backend_used = large_n_predict_cpu(
@@ -1841,6 +1834,10 @@ class GMMXX:
         return labels_b.squeeze(0) if batch_size is None else labels_b
 
     def predict_proba(self, data: torch.Tensor) -> torch.Tensor:
+        with self._matmul_precision_scope():
+            return self._predict_proba_impl(data)
+
+    def _predict_proba_impl(self, data: torch.Tensor) -> torch.Tensor:
         x_b, batch_size = self._prepare_predict_input(data)
         if self._is_large_cpu_stream_input(x_b):
             probs_b, backend_used = large_n_predict_proba_cpu(
@@ -2134,6 +2131,10 @@ class GMMXX:
         return probs_b.squeeze(0) if batch_size is None else probs_b
 
     def score_samples(self, data: torch.Tensor) -> torch.Tensor:
+        with self._matmul_precision_scope():
+            return self._score_samples_impl(data)
+
+    def _score_samples_impl(self, data: torch.Tensor) -> torch.Tensor:
         x_b, batch_size = self._prepare_predict_input(data)
         if self._is_large_cpu_stream_input(x_b):
             scores_b, backend_used = large_n_score_samples_cpu(
