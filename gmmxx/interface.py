@@ -893,7 +893,19 @@ class GMMXX:
     def _train_diag_cuda(self, x_b: torch.Tensor, batch_size: Optional[int]) -> None:
         """Diagonal-covariance EM loop on the CUDA backend.
 
-        Mirrors _train_spherical_cuda but with per-feature variance (B, K, D).
+        Replaces the SIMT diag_logsumexp / diag_resp pair (3 ms / iter at
+        D=32 K=64 N=65k fp32) with a cuBLAS augmented-GEMM E-step
+        (~70 μs / iter; 40x faster). The trick mirrors spherical's
+        Exp42-46 augmented GEMM extended to per-feature variance:
+
+            logit[n,k] = α[k] + Σ_d x[n,d]·μ[k,d]/σ²[k,d]
+                              - 0.5·Σ_d x[n,d]²/σ²[k,d]
+
+        With x_aug = [x | x²] (B, N, 2D) and means_aug =
+        [μ/σ² | -0.5/σ²] (B, K, 2D) the entire (B, N, K) logit comes from
+        one cuBLAS GEMM + bias add. M-step bmm reuses x_aug_with_ones =
+        [x | x² | 1] (B, N, 2D+1) so sum_x, sum_x_sq, and nk drop out of
+        a single (B, K, 2D+1) bmm.
         """
         from . import _cuda as _cuda_mod
 
@@ -916,23 +928,64 @@ class GMMXX:
         weights = torch.full((B, K), 1.0 / K, dtype=torch.float32, device=device)
         x_b_f = x_b.float()
 
+        # Build the diag-augmented caches once per fit:
+        #   x_aug_diag      = [x_f | x_f²]        (B, N, 2D)  E-step GEMM input
+        #   x_aug_full_diag = [x_f | x_f² | 1]    (B, N, 2D+1) M-step bmm input
+        # The trailing ones column lets us read nk = Σ resp from the same bmm.
+        x_sq = x_b_f.square()
+        ones_col = torch.ones((B, N, 1), dtype=torch.float32, device=device)
+        x_aug_full_diag = torch.cat([x_b_f, x_sq, ones_col], dim=-1).contiguous()
+        x_aug_diag = x_aug_full_diag[:, :, : 2 * D]  # strided view
+
         lower_bound_history: list[float] = []
         n_iter = 0
         prev_lb = -math.inf
         lb = float("-inf")
         ids: Optional[torch.Tensor] = None
+        half_D_log2pi = 0.5 * float(D) * math.log(2.0 * math.pi)
+        # When tol == 0 there's no early-termination check, so per-iter lb
+        # is not consumed. Skip both logsumexp and the .item() sync that
+        # would otherwise stall the CUDA stream.
+        skip_lb_per_iter = (self.tol == 0)
+        last_iter = self.niter - 1
 
-        for _ in range(self.niter):
+        for it in range(self.niter):
             n_iter += 1
-            lse = _cuda_mod.diag_logsumexp(x_b, means, var, log_w)
-            lb = float(lse.mean().item())
-            lower_bound_history.append(lb)
+            need_lb = (not skip_lb_per_iter) or (it == last_iter)
 
-            resp = _cuda_mod.diag_resp(x_b, means, var, log_w, lse)
-            nk = resp.sum(dim=1)
-            resp_t = resp.transpose(1, 2)
-            sums = torch.bmm(resp_t, x_b_f)
-            sumsq = torch.bmm(resp_t, x_b_f.square())
+            # ---- E-step: cuBLAS augmented GEMM ----
+            inv_var = var.reciprocal()
+            mu_inv_var = means * inv_var
+            log_det = 0.5 * torch.log(var).sum(dim=-1)
+            mu_sq_inv_var = (means.square() * inv_var).sum(dim=-1)
+            alpha = log_w - log_det - half_D_log2pi - 0.5 * mu_sq_inv_var
+            means_aug = torch.cat([mu_inv_var, -0.5 * inv_var], dim=-1).contiguous()
+
+            if B == 1:
+                logits = torch.addmm(
+                    alpha[0],
+                    x_aug_diag[0],
+                    means_aug[0].t(),
+                ).unsqueeze(0)
+            else:
+                logits = alpha.unsqueeze(1) + torch.matmul(
+                    x_aug_diag, means_aug.transpose(-1, -2)
+                )
+
+            if need_lb:
+                lse = logits.logsumexp(dim=-1)
+                lb = float(lse.mean().item())
+                lower_bound_history.append(lb)
+            else:
+                lower_bound_history.append(0.0)
+
+            resp = torch.softmax(logits, dim=-1)
+
+            # ---- M-step: single augmented bmm produces sum_x, sum_x_sq, nk ----
+            sum_aug = torch.bmm(resp.transpose(1, 2), x_aug_full_diag)  # (B, K, 2D+1)
+            sums = sum_aug[..., :D]
+            sumsq = sum_aug[..., D : 2 * D]
+            nk = sum_aug[..., 2 * D]
 
             active_mask = nk > 1e-8
             nk_safe = nk.clamp_min(1e-8)
@@ -1016,11 +1069,17 @@ class GMMXX:
         lb = float("-inf")
         ids: Optional[torch.Tensor] = None
 
-        for _ in range(self.niter):
+        skip_lb_per_iter = (self.tol == 0)
+        last_iter = self.niter - 1
+        for it in range(self.niter):
             n_iter += 1
             lse = _cuda_mod.tied_logsumexp(x_b, means, L, log_w)
-            lb = float(lse.mean().item())
-            lower_bound_history.append(lb)
+            need_lb = (not skip_lb_per_iter) or (it == last_iter)
+            if need_lb:
+                lb = float(lse.mean().item())
+                lower_bound_history.append(lb)
+            else:
+                lower_bound_history.append(0.0)
 
             resp = _cuda_mod.tied_resp(x_b, means, L, log_w, lse)
             counts = resp.sum(dim=1)
@@ -1030,9 +1089,10 @@ class GMMXX:
             )
             log_w = torch.log(weights.clamp_min(1e-30))
 
-            if abs(lb - prev_lb) < self.tol:
+            if need_lb and abs(lb - prev_lb) < self.tol:
                 break
-            prev_lb = lb
+            if need_lb:
+                prev_lb = lb
 
         # GMMXX exposes covariances_ as the full (D, D) covariance matrix.
         cov_b = L @ L.transpose(-1, -2)  # (B, D, D)
@@ -1094,11 +1154,17 @@ class GMMXX:
         lb = float("-inf")
         ids: Optional[torch.Tensor] = None
 
-        for _ in range(self.niter):
+        skip_lb_per_iter = (self.tol == 0)
+        last_iter = self.niter - 1
+        for it in range(self.niter):
             n_iter += 1
             lse = _cuda_mod.full_logsumexp(x_b, means, L, log_w)
-            lb = float(lse.mean().item())
-            lower_bound_history.append(lb)
+            need_lb = (not skip_lb_per_iter) or (it == last_iter)
+            if need_lb:
+                lb = float(lse.mean().item())
+                lower_bound_history.append(lb)
+            else:
+                lower_bound_history.append(0.0)
 
             resp = _cuda_mod.full_resp(x_b, means, L, log_w, lse)
             counts = resp.sum(dim=1)
@@ -1109,9 +1175,10 @@ class GMMXX:
             )
             log_w = torch.log(weights.clamp_min(1e-30))
 
-            if abs(lb - prev_lb) < self.tol:
+            if need_lb and abs(lb - prev_lb) < self.tol:
                 break
-            prev_lb = lb
+            if need_lb:
+                prev_lb = lb
 
         # GMMXX exposes covariances_ as the full (B, K, D, D) Σ_k.
         cov_b = L @ L.transpose(-1, -2)  # (B, K, D, D)
