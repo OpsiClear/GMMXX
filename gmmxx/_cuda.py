@@ -199,7 +199,6 @@ def _run_chunked_cublas_estep(
     if (
         x_estep_aug_bf16_cached is not None
         and not compute_lse and not compute_ids
-        and N_total >= 65536
     ):
         try:
             from .persistent_em_chunk_triton import persistent_em_iter
@@ -223,61 +222,36 @@ def _run_chunked_cublas_estep(
         except Exception:
             persistent_taken = False
 
-    # Triton kernel that fuses the per-chunk bf16 GEMM with softmax,
-    # skipping the (chunk_n, K) fp32 logits write. Only the no-lse / no-ids
-    # fast path uses it; lse/ids iters need the materialized logits.
-    use_triton_fused_estep = (
-        not persistent_taken
-        and x_estep_aug_bf16_cached is not None
-        and not compute_lse
-        and not compute_ids
-    )
-    addmm_softmax_chunk = None
-    if use_triton_fused_estep:
-        try:
-            from .addmm_softmax_chunk_triton import addmm_softmax_chunk
-        except ImportError:
-            use_triton_fused_estep = False
-
     chunk_iter_range = (
         range(0)  # empty: persistent path already filled sum_aug_acc
         if persistent_taken
         else range(0, N_total, chunk_size)
     )
-    # If persistent didn't run and the chunked loop will use the fp32 addmm
-    # path (no triton fused), we need fp32 alpha/means_aug.
-    if (not persistent_taken
-            and not use_triton_fused_estep
-            and alpha is None):
+    # If persistent didn't run, the chunked Python fallback below uses the
+    # fp32 cuBLAS addmm path and needs fp32 alpha/means_aug.
+    if not persistent_taken and alpha is None:
         alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
 
     first_chunk = True
     for n_start in chunk_iter_range:
         n_end = min(n_start + chunk_size, N_total)
-        if use_triton_fused_estep:
-            resp_chunk = addmm_softmax_chunk(
+        if x_estep_aug_bf16_cached is not None:
+            logits_chunk = torch.addmm(
+                alpha_bf16,
                 x_estep_aug_bf16_cached[0, n_start:n_end],
                 means_aug_bf16_t,
-                alpha_bf16,
-            )
+            ).float().unsqueeze(0)
         else:
-            if x_estep_aug_bf16_cached is not None:
-                logits_chunk = torch.addmm(
-                    alpha_bf16,
-                    x_estep_aug_bf16_cached[0, n_start:n_end],
-                    means_aug_bf16_t,
-                ).float().unsqueeze(0)
-            else:
-                logits_chunk = torch.addmm(
-                    alpha[0],
-                    x_estep_aug_cached[0, n_start:n_end],
-                    means_aug[0].transpose(-1, -2),
-                ).unsqueeze(0)
-            if compute_lse:
-                lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
-            if compute_ids:
-                ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
-            resp_chunk = torch.softmax(logits_chunk, dim=-1)
+            logits_chunk = torch.addmm(
+                alpha[0],
+                x_estep_aug_cached[0, n_start:n_end],
+                means_aug[0].transpose(-1, -2),
+            ).unsqueeze(0)
+        if compute_lse:
+            lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
+        if compute_ids:
+            ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
+        resp_chunk = torch.softmax(logits_chunk, dim=-1)
         # baddbmm fuses bmm + add into the cuBLAS GEMM beta-epilogue. First
         # chunk uses beta=0 so the uninitialized sum_aug_acc is overwritten
         # without requiring a separate zero_() call.
