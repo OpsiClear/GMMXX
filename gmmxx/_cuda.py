@@ -264,14 +264,10 @@ def soft_update_spherical(
             if (x_estep_aug_cached is not None
                     and means_f.is_contiguous() and var.is_contiguous()
                     and log_w.is_contiguous()):
-                # Custom CUDA kernel fuses ~10 small (B,K) torch ops into
-                # a single launch: alpha + means_aug build.
-                alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
-                # Exp85: also call the bf16+transposed prepare variant when we
-                # will route through the persistent-CTA Triton kernel —
-                # emits the required (D+1, K) bf16 layout in one launch
-                # instead of the fp32 cast + transpose + contiguous chain
-                # later (saves ~20 μs / iter on the bench shape).
+                # Exp87: skip the fp32 prepare_spherical_estep call when the
+                # persistent-CTA Triton path will run (bf16_t prepare emits
+                # everything that path needs). The non-persistent fallback
+                # branches lazy-build alpha/means_aug below if reached.
                 _emit_bf16_t = (
                     x_estep_aug_bf16_cached is not None
                     and not compute_lse and not compute_ids
@@ -282,7 +278,12 @@ def soft_update_spherical(
                     alpha_bf16_pre, means_aug_t_bf16_pre = (
                         _C.prepare_spherical_estep_bf16_t(log_w, means_f, var)
                     )
+                    # Defer fp32 alpha/means_aug; only built if a non-persistent
+                    # branch needs them (rare: persistent kernel exception).
+                    alpha = None
+                    means_aug = None
                 else:
+                    alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                     alpha_bf16_pre = None
                     means_aug_t_bf16_pre = None
                 # Large-N L2-streaming path: chunk N so per-chunk
@@ -400,6 +401,13 @@ def soft_update_spherical(
                         if _persistent_taken
                         else range(0, _N_total, chunk_size)
                     )
+                    # Lazy-fallback: if persistent didn't run and the chunked
+                    # loop will use the fp32 addmm path (no triton fused),
+                    # we need fp32 alpha/means_aug.
+                    if (not _persistent_taken
+                            and not _use_triton_fused_estep
+                            and alpha is None):
+                        alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                     for n_start in _chunk_iter_range:
                         n_end = min(n_start + chunk_size, _N_total)
                         if _use_triton_fused_estep:
@@ -447,6 +455,9 @@ def soft_update_spherical(
                     if compute_ids:
                         ids = ids_full
                 elif B == 1:
+                    # Lazy-build alpha/means_aug fp32 if Exp87 deferred them.
+                    if alpha is None:
+                        alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                     if x_estep_aug_bf16_cached is not None:
                         # Exp64: addmm bf16 fuses bias-add into cuBLAS epilogue.
                         means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2)
@@ -463,6 +474,8 @@ def soft_update_spherical(
                             means_aug[0].transpose(-1, -2),
                         ).unsqueeze(0)
                 else:
+                    if alpha is None:
+                        alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                     logits = alpha.unsqueeze(1) + torch.matmul(
                         x_estep_aug_cached, means_aug.transpose(-1, -2)
                     )
