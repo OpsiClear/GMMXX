@@ -222,18 +222,18 @@ def _run_chunked_cublas_estep(
         except Exception:
             persistent_taken = False
 
-    chunk_iter_range = (
-        range(0)  # empty: persistent path already filled sum_aug_acc
-        if persistent_taken
-        else range(0, N_total, chunk_size)
-    )
-    # If persistent didn't run, the chunked Python fallback below uses the
-    # fp32 cuBLAS addmm path and needs fp32 alpha/means_aug.
-    if not persistent_taken and alpha is None:
+    if persistent_taken:
+        # Persistent kernel filled sum_aug_acc in one launch.
+        return sum_aug_acc, lse_full, ids_full, alpha, means_aug
+
+    # Fallback: chunked Python loop. cuBLAS addmm bf16 + torch.softmax +
+    # cuBLAS baddbmm bf16 per chunk. Hits when persistent threw, when
+    # compute_lse/ids requires materialized logits, or when no bf16 cache.
+    if alpha is None:
         alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
 
     first_chunk = True
-    for n_start in chunk_iter_range:
+    for n_start in range(0, N_total, chunk_size):
         n_end = min(n_start + chunk_size, N_total)
         if x_estep_aug_bf16_cached is not None:
             logits_chunk = torch.addmm(
