@@ -222,6 +222,7 @@ def soft_update_spherical(
     x_estep_aug_cached: Optional[torch.Tensor] = None,
     x_estep_aug_bf16_cached: Optional[torch.Tensor] = None,
     x_aug_bf16_cached: Optional[torch.Tensor] = None,
+    persistent_partial_buf: Optional[torch.Tensor] = None,
     compute_ids: bool = True,
     compute_lse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -372,6 +373,7 @@ def soft_update_spherical(
                                 _x_aug_for_kernel,
                                 NUM_CTAS=256,
                                 BLOCK_N=64, BLOCK_D1=64, BLOCK_D2=256,
+                                partial_buffer=persistent_partial_buf,
                             ).unsqueeze(0)
                             _persistent_taken = True
                         except Exception:

@@ -563,6 +563,23 @@ class GMMXX:
                 # 0.95 ms -> 0.46 ms (2x).
                 x_aug_bf16_cached = x_aug_cached.to(torch.bfloat16).contiguous()
 
+        # Exp86: pre-allocate the persistent kernel's per-CTA partial buffer
+        # so the inner soft_update_spherical call doesn't allocate it on
+        # every iter. Sized for NUM_CTAS=256 (Exp83 default) and the bench
+        # bottleneck (D+2)*K*4 = ~33 KB per CTA = ~8 MB total.
+        persistent_partial_buf: Optional[torch.Tensor] = None
+        if (
+            use_soft_update
+            and B == 1
+            and x_aug_cached is not None
+            and x_estep_aug_bf16_cached is not None
+            and N >= 65536
+        ):
+            Dp2_pre = x_aug_cached.shape[2]
+            persistent_partial_buf = torch.empty(
+                (256, K, Dp2_pre), dtype=torch.float32, device=device
+            )
+
         # Hoist hot-path attribute and module-attribute lookups out of
         # the Python loop. The interpreter's name resolution per iter on
         # small shapes (where each iter is < 1 ms) is non-trivial.
@@ -601,6 +618,7 @@ class GMMXX:
                     x_estep_aug_cached=x_estep_aug_cached,
                     x_estep_aug_bf16_cached=x_estep_aug_bf16_cached,
                     x_aug_bf16_cached=x_aug_bf16_cached,
+                    persistent_partial_buf=persistent_partial_buf,
                     compute_ids=is_last,
                     compute_lse=_need_lse,
                 )
