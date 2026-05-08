@@ -114,6 +114,24 @@ def _spherical_logits_torch(x: torch.Tensor, means: torch.Tensor,
     return log_w.unsqueeze(1) - log_norm_const - 0.5 * dist / var.unsqueeze(1)
 
 
+def _means_alpha_to_bf16_t(
+    alpha: torch.Tensor, means_aug: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cast (alpha, means_aug) from the fp32 prepare_spherical_estep
+    output to the bf16 + transposed form the cuBLAS bf16 addmm and the
+    persistent-CTA Triton kernel both want.
+
+    Returns (alpha_bf16 (K,), means_aug_bf16_t (D+1, K) contiguous).
+
+    Skip the Python casts entirely when prepare_spherical_estep_bf16_t
+    is available — the kernel writes the layout directly. This helper
+    is the fallback path.
+    """
+    means_aug_bf16_t = means_aug[0].to(torch.bfloat16).t().contiguous()
+    alpha_bf16 = alpha[0].to(torch.bfloat16)
+    return alpha_bf16, means_aug_bf16_t
+
+
 def _use_torch_fastpath_spherical(x: torch.Tensor) -> bool:
     """True when the cuBLAS GEMM path is expected to beat the safe SIMT kernel.
 
@@ -342,15 +360,15 @@ def soft_update_spherical(
                             (B, _N_total), dtype=torch.int32, device=x.device
                         )
                     if x_estep_aug_bf16_cached is not None:
-                        # Exp64/84/85: build alpha_bf16 + means_aug_bf16_t.
-                        # When prepare_estep_bf16_t already emitted them
-                        # (Exp85 path), reuse directly; otherwise cast.
+                        # Reuse bf16+transposed outputs when prepare_estep_bf16_t
+                        # emitted them; otherwise cast via the shared helper.
                         if alpha_bf16_pre is not None and means_aug_t_bf16_pre is not None:
                             alpha_bf16 = alpha_bf16_pre[0]
                             means_aug_bf16_t = means_aug_t_bf16_pre[0]
                         else:
-                            means_aug_bf16_t = means_aug[0].to(torch.bfloat16).t().contiguous()
-                            alpha_bf16 = alpha[0].to(torch.bfloat16)
+                            alpha_bf16, means_aug_bf16_t = (
+                                _means_alpha_to_bf16_t(alpha, means_aug)
+                            )
 
                     # Exp78: persistent-CTA Triton kernel — processes the full
                     # N range in one launch with a per-CTA partial accumulator
@@ -460,13 +478,15 @@ def soft_update_spherical(
                     if compute_ids:
                         ids = ids_full
                 elif B == 1:
-                    # Lazy-build alpha/means_aug fp32 if Exp87 deferred them.
+                    # Lazy-build alpha/means_aug fp32 if the bf16_t prepare
+                    # path deferred them.
                     if alpha is None:
                         alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
                     if x_estep_aug_bf16_cached is not None:
-                        # Exp64: addmm bf16 fuses bias-add into cuBLAS epilogue.
-                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2)
-                        alpha_bf16 = alpha[0].to(torch.bfloat16)
+                        # addmm bf16 fuses bias-add into cuBLAS epilogue.
+                        alpha_bf16, means_aug_bf16_t = (
+                            _means_alpha_to_bf16_t(alpha, means_aug)
+                        )
                         logits = torch.addmm(
                             alpha_bf16,
                             x_estep_aug_bf16_cached[0],

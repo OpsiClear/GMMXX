@@ -124,7 +124,7 @@ def persistent_em_iter(
     x_bf16: torch.Tensor,        # (N, D1) bf16
     means_aug_t_bf16: torch.Tensor, # (D1, K) bf16
     alpha_bf16: torch.Tensor,     # (K,) bf16
-    x_aug: torch.Tensor,         # (N, D2) fp32
+    x_aug: torch.Tensor,         # (N, D2) fp32 OR bf16
     *,
     NUM_CTAS: int = 128,
     BLOCK_N: int = 64,
@@ -132,12 +132,33 @@ def persistent_em_iter(
     BLOCK_D2: int = 64,
     partial_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Returns sum_aug (K, D2) fp32 = sum_n softmax(addmm(alpha, x, means_t))[n,:].T * x_aug[n,:]."""
+    """Persistent-CTA EM iter: returns sum_aug (K, D2) fp32 =
+    sum_n softmax(addmm(alpha, x, means_t))[n,:].T * x_aug[n,:].
+
+    The first three inputs MUST be bf16 — they drive a tl.dot(bf16, bf16)
+    GEMM that uses HMMA tensor cores with an fp32 accumulator.
+
+    `x_aug` accepts either fp32 OR bf16. The kernel branches on dtype
+    via a constexpr:
+      bf16: tl.dot(resp_bf16, x_aug_bf16) — HMMA, fp32 accumulator,
+            ~2x faster on Ada (Exp80).
+      fp32: tl.dot(resp_fp32, x_aug_fp32) — TF32, fp32 accumulator.
+    The fp32 path is the fallback when no bf16 cache is available.
+    Other dtypes (fp16, fp64) are not supported.
+    """
     N, D1 = x_bf16.shape
     D1_m, K = means_aug_t_bf16.shape
     D2 = x_aug.size(1)
     assert D1 == D1_m
     assert x_aug.size(0) == N
+    assert x_bf16.dtype == torch.bfloat16, \
+        f"x_bf16 must be bf16, got {x_bf16.dtype}"
+    assert means_aug_t_bf16.dtype == torch.bfloat16, \
+        f"means_aug_t_bf16 must be bf16, got {means_aug_t_bf16.dtype}"
+    assert alpha_bf16.dtype == torch.bfloat16, \
+        f"alpha_bf16 must be bf16, got {alpha_bf16.dtype}"
+    assert x_aug.dtype in (torch.float32, torch.bfloat16), \
+        f"x_aug must be fp32 or bf16, got {x_aug.dtype}"
 
     BLOCK_K = max(16, triton.next_power_of_2(K))
     d2_blocks = triton.cdiv(D2, BLOCK_D2)
