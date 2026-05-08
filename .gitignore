@@ -33,3 +33,7 @@ build_log*.txt
 uv.lock
 bench_inner.py
 profile_soft.py
+
+# Auto-tune experiment log — kept locally so reverts don't erase
+# experiment history (per the auto-tune skill rule).
+results.tsv
