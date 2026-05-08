@@ -124,7 +124,6 @@ def _build_extension():
         str(CSRC / "mstep" / "blocked_diag_sorted.cu"),
         str(CSRC / "mstep" / "finalize_diag.cu"),
         str(CSRC / "fused" / "spherical_fused.cu"),
-        str(CSRC / "em" / "spherical_em.cu"),
         str(nb_combined),
     ]
     include_dirs = [
@@ -134,7 +133,6 @@ def _build_extension():
         str(CSRC / "estep"),
         str(CSRC / "mstep"),
         str(CSRC / "fused"),
-        str(CSRC / "em"),
         nb_include,
         str(nb_robin_include),
     ]

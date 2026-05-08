@@ -264,14 +264,22 @@ def soft_update_spherical(
             if (x_estep_aug_cached is not None
                     and means_f.is_contiguous() and var.is_contiguous()
                     and log_w.is_contiguous()):
-                # Exp87: skip the fp32 prepare_spherical_estep call when the
-                # persistent-CTA Triton path will run (bf16_t prepare emits
-                # everything that path needs). The non-persistent fallback
-                # branches lazy-build alpha/means_aug below if reached.
+                K_dim = means_f.shape[1]
+                _N_total = x_estep_aug_cached.shape[1]
+                _full_resp_mb = _N_total * K_dim * 4 / (1024 * 1024)
+                # Skip the fp32 prepare_spherical_estep call when the
+                # persistent-CTA Triton path will actually run. The bf16_t
+                # prepare emits the layout that path needs directly. Gate also
+                # checks the chunked-path threshold and the persistent-kernel
+                # N floor — outside that window the bf16_t outputs would be
+                # discarded. The non-persistent fallback branches lazy-build
+                # alpha/means_aug.
                 _emit_bf16_t = (
                     x_estep_aug_bf16_cached is not None
                     and not compute_lse and not compute_ids
                     and B == 1
+                    and _full_resp_mb >= 8       # chunked-path activation
+                    and _N_total >= 65536         # persistent-kernel floor
                     and hasattr(_C, "prepare_spherical_estep_bf16_t")
                 )
                 if _emit_bf16_t:
@@ -292,9 +300,6 @@ def soft_update_spherical(
                 # Threshold: chunk when full (N*K) fp32 > 64 MB. The 72 MB
                 # L2 on Ada can hold smaller chunks across the softmax->bmm
                 # hop; chunking below ~64 MB is mostly launch overhead.
-                K_dim = means_f.shape[1]
-                _N_total = x_estep_aug_cached.shape[1]
-                _full_resp_mb = _N_total * K_dim * 4 / (1024 * 1024)
                 # Exp66: keep chunked path on the last iter too (when lse
                 # and/or ids are needed). Per-chunk lse_chunk and ids_chunk
                 # are written into pre-allocated (B,N) buffers so we still

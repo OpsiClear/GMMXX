@@ -10,7 +10,6 @@
 #include "mstep/spherical.h"
 #include "mstep/diag.h"
 #include "fused/spherical.h"
-#include "em/spherical_em.h"
 
 namespace nb = nanobind;
 
@@ -188,22 +187,5 @@ NB_MODULE(_C, m) {
           nb::arg("x"), nb::arg("means"), nb::arg("var"), nb::arg("log_w"),
           nb::arg("log_norm"), nb::arg("out") = nb::none(),
           "Diagonal E-step responsibilities. Returns fp32 (B, N, K).");
-
-    m.def(
-        "spherical_em_soft_chunked",
-        &gmmxx::em::spherical::soft_chunked,
-        nb::arg("x_estep_aug"),
-        nb::arg("x_estep_aug_bf16"),
-        nb::arg("x_aug"),
-        nb::arg("means"),
-        nb::arg("var"),
-        nb::arg("log_w"),
-        nb::arg("n_iter"),
-        nb::arg("reg_covar"),
-        nb::arg("chunk_size"),
-        nb::arg("need_final_lse"),
-        "Exp63: C++-side EM-loop driver for spherical soft-EM cuBLAS chunked "
-        "fastpath. Runs n_iter iterations end-to-end with no per-iter Python "
-        "dispatch. Returns (means, var, weights, lower_bound, final_lse_or_empty).");
 
 }

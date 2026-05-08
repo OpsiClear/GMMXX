@@ -563,10 +563,13 @@ class GMMXX:
                 # 0.95 ms -> 0.46 ms (2x).
                 x_aug_bf16_cached = x_aug_cached.to(torch.bfloat16).contiguous()
 
-        # Exp86: pre-allocate the persistent kernel's per-CTA partial buffer
-        # so the inner soft_update_spherical call doesn't allocate it on
-        # every iter. Sized for NUM_CTAS=256 (Exp83 default) and the bench
-        # bottleneck (D+2)*K*4 = ~33 KB per CTA = ~8 MB total.
+        # Pre-allocate the persistent kernel's per-CTA partial buffer so the
+        # inner soft_update_spherical call doesn't allocate it on every iter.
+        # Only allocate when the persistent path will actually run on at
+        # least one iter — the kernel requires bf16 cache, B=1, N>=65k, and
+        # at least one iter without lse/ids. With tol=0 the inner iters all
+        # skip lse/ids; with tol>0 every iter needs lse so the persistent
+        # path never fires and the buffer would be wasted.
         persistent_partial_buf: Optional[torch.Tensor] = None
         if (
             use_soft_update
@@ -574,6 +577,8 @@ class GMMXX:
             and x_aug_cached is not None
             and x_estep_aug_bf16_cached is not None
             and N >= 65536
+            and self.tol == 0
+            and self.niter >= 2
         ):
             Dp2_pre = x_aug_cached.shape[2]
             persistent_partial_buf = torch.empty(
