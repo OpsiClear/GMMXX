@@ -114,6 +114,185 @@ def _spherical_logits_torch(x: torch.Tensor, means: torch.Tensor,
     return log_w.unsqueeze(1) - log_norm_const - 0.5 * dist / var.unsqueeze(1)
 
 
+def _run_chunked_cublas_estep(
+    *,
+    x: torch.Tensor,
+    means_f: torch.Tensor,
+    var: torch.Tensor,
+    log_w: torch.Tensor,
+    x_aug_cached: torch.Tensor,
+    x_estep_aug_cached: torch.Tensor,
+    x_estep_aug_bf16_cached: Optional[torch.Tensor],
+    x_aug_bf16_cached: Optional[torch.Tensor],
+    persistent_partial_buf: Optional[torch.Tensor],
+    alpha_pre,
+    means_aug_pre,
+    alpha_bf16_pre,
+    means_aug_t_bf16_pre,
+    K_dim: int,
+    N_total: int,
+    compute_lse: bool,
+    compute_ids: bool,
+):
+    """Chunked cuBLAS-fastpath E-step + M-step partial for the spherical
+    soft-EM loop.
+
+    Picks the best available implementation for this iter:
+      1. Persistent-CTA Triton kernel (full-N single launch, requires bf16
+         cache, no lse/ids, N>=65536).
+      2. Per-chunk Triton fused addmm+softmax + cuBLAS baddbmm.
+      3. Per-chunk cuBLAS addmm bf16 + torch.softmax + cuBLAS baddbmm.
+      4. Per-chunk cuBLAS addmm fp32 (when no bf16 cache).
+
+    Returns (sum_aug (B,K,D+2) fp32, lse_full or None, ids_full or None,
+    alpha_fp32_lazy_or_orig, means_aug_fp32_lazy_or_orig). The last two
+    are returned so the caller can reuse the lazy-built fp32 outputs if
+    its later epilogue branches need them.
+    """
+    B = x.shape[0]
+    Dp2 = x_aug_cached.shape[2]
+
+    # 16 MB target. cuBLAS addmm-bf16 collapses the per-chunk E-step into
+    # one launch, so per-chunk launch overhead is below the L2-pressure win
+    # from smaller chunks. Sweep on D=128 K=64 N=524k fp32 had 16 MB best
+    # at 32.5 ms vs 34.8 ms at 32 MB and 40.3 ms at 64 MB.
+    target_chunk_bytes = 16 * 1024 * 1024
+    chunk_size = max(65536, target_chunk_bytes // (K_dim * 4))
+
+    # torch.empty + first-chunk beta=0 skips the zero-write kernel
+    # (~2 μs/iter) — baddbmm with beta=0 ignores the input tensor entirely
+    # on the first chunk.
+    sum_aug_acc = torch.empty(
+        (B, K_dim, Dp2), dtype=torch.float32, device=x.device
+    )
+    lse_full = (
+        torch.empty((B, N_total), dtype=torch.float32, device=x.device)
+        if compute_lse else None
+    )
+    ids_full = (
+        torch.empty((B, N_total), dtype=torch.int32, device=x.device)
+        if compute_ids else None
+    )
+
+    alpha = alpha_pre
+    means_aug = means_aug_pre
+
+    # bf16 alpha/means_aug for the cuBLAS bf16 addmm and the persistent kernel.
+    alpha_bf16 = None
+    means_aug_bf16_t = None
+    if x_estep_aug_bf16_cached is not None:
+        # Reuse bf16+transposed outputs when prepare_estep_bf16_t emitted
+        # them; otherwise cast via the shared helper.
+        if alpha_bf16_pre is not None and means_aug_t_bf16_pre is not None:
+            alpha_bf16 = alpha_bf16_pre[0]
+            means_aug_bf16_t = means_aug_t_bf16_pre[0]
+        else:
+            alpha_bf16, means_aug_bf16_t = (
+                _means_alpha_to_bf16_t(alpha, means_aug)
+            )
+
+    # Persistent-CTA Triton kernel processes the full N range in one launch
+    # with a per-CTA partial accumulator held across BLOCK_N tiles, then
+    # reduces 256 partials. Bypasses the chunked Python loop entirely when
+    # conditions allow.
+    persistent_taken = False
+    if (
+        x_estep_aug_bf16_cached is not None
+        and not compute_lse and not compute_ids
+        and N_total >= 65536
+    ):
+        try:
+            from .persistent_em_chunk_triton import persistent_em_iter
+            # Pass bf16 x_aug when available — kernel uses tl.dot(bf16, bf16)
+            # with fp32 accumulator, halving x_aug read BW vs fp32.
+            x_aug_for_kernel = (
+                x_aug_bf16_cached[0]
+                if x_aug_bf16_cached is not None
+                else x_aug_cached[0]
+            )
+            sum_aug_acc = persistent_em_iter(
+                x_estep_aug_bf16_cached[0],
+                means_aug_bf16_t,
+                alpha_bf16,
+                x_aug_for_kernel,
+                NUM_CTAS=256,
+                BLOCK_N=64, BLOCK_D1=64, BLOCK_D2=256,
+                partial_buffer=persistent_partial_buf,
+            ).unsqueeze(0)
+            persistent_taken = True
+        except Exception:
+            persistent_taken = False
+
+    # Triton kernel that fuses the per-chunk bf16 GEMM with softmax,
+    # skipping the (chunk_n, K) fp32 logits write. Only the no-lse / no-ids
+    # fast path uses it; lse/ids iters need the materialized logits.
+    use_triton_fused_estep = (
+        not persistent_taken
+        and x_estep_aug_bf16_cached is not None
+        and not compute_lse
+        and not compute_ids
+    )
+    addmm_softmax_chunk = None
+    if use_triton_fused_estep:
+        try:
+            from .addmm_softmax_chunk_triton import addmm_softmax_chunk
+        except ImportError:
+            use_triton_fused_estep = False
+
+    chunk_iter_range = (
+        range(0)  # empty: persistent path already filled sum_aug_acc
+        if persistent_taken
+        else range(0, N_total, chunk_size)
+    )
+    # If persistent didn't run and the chunked loop will use the fp32 addmm
+    # path (no triton fused), we need fp32 alpha/means_aug.
+    if (not persistent_taken
+            and not use_triton_fused_estep
+            and alpha is None):
+        alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
+
+    first_chunk = True
+    for n_start in chunk_iter_range:
+        n_end = min(n_start + chunk_size, N_total)
+        if use_triton_fused_estep:
+            resp_chunk = addmm_softmax_chunk(
+                x_estep_aug_bf16_cached[0, n_start:n_end],
+                means_aug_bf16_t,
+                alpha_bf16,
+            )
+        else:
+            if x_estep_aug_bf16_cached is not None:
+                logits_chunk = torch.addmm(
+                    alpha_bf16,
+                    x_estep_aug_bf16_cached[0, n_start:n_end],
+                    means_aug_bf16_t,
+                ).float().unsqueeze(0)
+            else:
+                logits_chunk = torch.addmm(
+                    alpha[0],
+                    x_estep_aug_cached[0, n_start:n_end],
+                    means_aug[0].transpose(-1, -2),
+                ).unsqueeze(0)
+            if compute_lse:
+                lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
+            if compute_ids:
+                ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
+            resp_chunk = torch.softmax(logits_chunk, dim=-1)
+        # baddbmm fuses bmm + add into the cuBLAS GEMM beta-epilogue. First
+        # chunk uses beta=0 so the uninitialized sum_aug_acc is overwritten
+        # without requiring a separate zero_() call.
+        torch.baddbmm(
+            sum_aug_acc,
+            resp_chunk.transpose(1, 2),
+            x_aug_cached[:, n_start:n_end],
+            beta=0.0 if first_chunk else 1.0,
+            out=sum_aug_acc,
+        )
+        first_chunk = False
+
+    return sum_aug_acc, lse_full, ids_full, alpha, means_aug
+
+
 def _means_alpha_to_bf16_t(
     alpha: torch.Tensor, means_aug: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -332,144 +511,28 @@ def soft_update_spherical(
                     and _full_resp_mb >= 8
                 )
                 if _use_chunked:
-                    # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
-                    # 16 MB target. cuBLAS addmm-bf16 collapses the per-chunk
-                    # E-step into one launch, so per-chunk launch overhead is
-                    # below the L2-pressure win from smaller chunks. Sweep on
-                    # D=128 K=64 N=524k fp32 had 16 MB best at 32.5 ms vs
-                    # 34.8 ms at 32 MB and 40.3 ms at 64 MB.
-                    target_chunk_bytes = 16 * 1024 * 1024
-                    chunk_size = max(65536, target_chunk_bytes // (K_dim * 4))
-                    Dp2 = x_aug_cached.shape[2]
-                    # torch.empty + first-chunk beta=0 skips the zero-write
-                    # kernel (~2 μs/iter) — baddbmm with beta=0 ignores the
-                    # input tensor entirely on the first chunk.
-                    sum_aug_acc = torch.empty(
-                        (B, K_dim, Dp2), dtype=torch.float32, device=x.device
-                    )
-                    lse_full = None
-                    ids_full = None
-                    if compute_lse:
-                        lse_full = torch.empty(
-                            (B, _N_total), dtype=torch.float32, device=x.device
+                    sum_aug, lse_full, ids_full, alpha, means_aug = (
+                        _run_chunked_cublas_estep(
+                            x=x,
+                            means_f=means_f,
+                            var=var,
+                            log_w=log_w,
+                            x_aug_cached=x_aug_cached,
+                            x_estep_aug_cached=x_estep_aug_cached,
+                            x_estep_aug_bf16_cached=x_estep_aug_bf16_cached,
+                            x_aug_bf16_cached=x_aug_bf16_cached,
+                            persistent_partial_buf=persistent_partial_buf,
+                            alpha_pre=alpha,
+                            means_aug_pre=means_aug,
+                            alpha_bf16_pre=alpha_bf16_pre,
+                            means_aug_t_bf16_pre=means_aug_t_bf16_pre,
+                            K_dim=K_dim,
+                            N_total=_N_total,
+                            compute_lse=compute_lse,
+                            compute_ids=compute_ids,
                         )
-                    if compute_ids:
-                        ids_full = torch.empty(
-                            (B, _N_total), dtype=torch.int32, device=x.device
-                        )
-                    if x_estep_aug_bf16_cached is not None:
-                        # Reuse bf16+transposed outputs when prepare_estep_bf16_t
-                        # emitted them; otherwise cast via the shared helper.
-                        if alpha_bf16_pre is not None and means_aug_t_bf16_pre is not None:
-                            alpha_bf16 = alpha_bf16_pre[0]
-                            means_aug_bf16_t = means_aug_t_bf16_pre[0]
-                        else:
-                            alpha_bf16, means_aug_bf16_t = (
-                                _means_alpha_to_bf16_t(alpha, means_aug)
-                            )
-
-                    # Persistent-CTA Triton kernel processes the full N range
-                    # in one launch with a per-CTA partial accumulator held
-                    # across BLOCK_N tiles, then reduces 256 partials. Bypasses
-                    # the chunked Python loop entirely when conditions allow.
-                    _persistent_taken = False
-                    if (
-                        x_estep_aug_bf16_cached is not None
-                        and not compute_lse and not compute_ids
-                        and _N_total >= 65536
-                    ):
-                        try:
-                            from .persistent_em_chunk_triton import persistent_em_iter
-                            # Pass bf16 x_aug when available — the kernel uses
-                            # tl.dot(bf16, bf16) with fp32 accumulator,
-                            # halving x_aug read BW vs the fp32 path.
-                            _x_aug_for_kernel = (
-                                x_aug_bf16_cached[0]
-                                if x_aug_bf16_cached is not None
-                                else x_aug_cached[0]
-                            )
-                            sum_aug_acc = persistent_em_iter(
-                                x_estep_aug_bf16_cached[0],
-                                means_aug_bf16_t,
-                                alpha_bf16,
-                                _x_aug_for_kernel,
-                                NUM_CTAS=256,
-                                BLOCK_N=64, BLOCK_D1=64, BLOCK_D2=256,
-                                partial_buffer=persistent_partial_buf,
-                            ).unsqueeze(0)
-                            _persistent_taken = True
-                        except Exception:
-                            _persistent_taken = False
-
-                    # Triton kernel fuses the per-chunk bf16 GEMM with
-                    # softmax, skipping the (chunk_n, K) fp32 logits write.
-                    # Only the no-lse / no-ids fast path uses it; lse/ids
-                    # iters need the materialized logits.
-                    _use_triton_fused_estep = (
-                        not _persistent_taken
-                        and x_estep_aug_bf16_cached is not None
-                        and not compute_lse
-                        and not compute_ids
                     )
-                    if _use_triton_fused_estep:
-                        try:
-                            from .addmm_softmax_chunk_triton import addmm_softmax_chunk
-                        except ImportError:
-                            _use_triton_fused_estep = False
-                    _first_chunk = True
-                    _chunk_iter_range = (
-                        range(0)  # empty: persistent path already filled sum_aug_acc
-                        if _persistent_taken
-                        else range(0, _N_total, chunk_size)
-                    )
-                    # Lazy-fallback: if persistent didn't run and the chunked
-                    # loop will use the fp32 addmm path (no triton fused),
-                    # we need fp32 alpha/means_aug.
-                    if (not _persistent_taken
-                            and not _use_triton_fused_estep
-                            and alpha is None):
-                        alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
-                    for n_start in _chunk_iter_range:
-                        n_end = min(n_start + chunk_size, _N_total)
-                        if _use_triton_fused_estep:
-                            resp_chunk = addmm_softmax_chunk(
-                                x_estep_aug_bf16_cached[0, n_start:n_end],
-                                means_aug_bf16_t,
-                                alpha_bf16,
-                            )
-                        else:
-                            if x_estep_aug_bf16_cached is not None:
-                                logits_chunk = torch.addmm(
-                                    alpha_bf16,
-                                    x_estep_aug_bf16_cached[0, n_start:n_end],
-                                    means_aug_bf16_t,
-                                ).float().unsqueeze(0)
-                            else:
-                                logits_chunk = torch.addmm(
-                                    alpha[0],
-                                    x_estep_aug_cached[0, n_start:n_end],
-                                    means_aug[0].transpose(-1, -2),
-                                ).unsqueeze(0)
-                            if compute_lse:
-                                lse_full[:, n_start:n_end] = logits_chunk.logsumexp(dim=-1)
-                            if compute_ids:
-                                ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
-                            resp_chunk = torch.softmax(logits_chunk, dim=-1)
-                        # baddbmm fuses bmm + add into the cuBLAS GEMM
-                        # beta-epilogue. First chunk uses beta=0 so the
-                        # uninitialized sum_aug_acc is overwritten without
-                        # requiring a separate zero_() call.
-                        torch.baddbmm(
-                            sum_aug_acc,
-                            resp_chunk.transpose(1, 2),
-                            x_aug_cached[:, n_start:n_end],
-                            beta=0.0 if _first_chunk else 1.0,
-                            out=sum_aug_acc,
-                        )
-                        _first_chunk = False
-                    # Mark for downstream branch; resp / logits not materialized
-                    # globally in chunked mode.
-                    sum_aug = sum_aug_acc
+                    # resp / logits not materialized globally in chunked mode.
                     resp = None
                     logits = None
                     lse = lse_full
