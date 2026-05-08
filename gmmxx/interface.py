@@ -3,9 +3,16 @@ from __future__ import annotations
 import math
 from typing import Any, Optional
 
+import os
+
 import torch
 
-from ._runtime import triton_spherical_supported
+from ._runtime import (
+    cuda_diag_streamed_supported,
+    cuda_full_streamed_supported,
+    cuda_tied_streamed_supported,
+    triton_spherical_supported,
+)
 
 try:
     from .assign_spherical_triton import (
@@ -272,8 +279,24 @@ class GMMXX:
         return self.backend in {"auto", "triton"}
 
     def _apply_matmul_precision(self) -> None:
-        if self.matmul_precision is not None:
-            torch.set_float32_matmul_precision(self.matmul_precision)
+        """Apply matmul_precision globally for the duration of one call.
+
+        Returns the previous setting so the caller can restore it. We
+        deliberately do not leak the change across calls — earlier
+        behavior left torch.get_float32_matmul_precision() perturbed
+        after fit(), corrupting downstream tests that rely on
+        full-precision fp32 matmul.
+        """
+        if self.matmul_precision is None:
+            return None
+        prev = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision(self.matmul_precision)
+        return prev
+
+    @staticmethod
+    def _restore_matmul_precision(prev) -> None:
+        if prev is not None:
+            torch.set_float32_matmul_precision(prev)
 
     def _invalidate_inference_caches(self) -> None:
         self._diag_inference_cache = None
@@ -450,6 +473,116 @@ class GMMXX:
             self.last_backend_used_ = "triton"
         else:
             self.last_backend_used_ = "torch"
+
+    def _can_use_cuda_tensor_streamed_fit(
+        self, covariance_type: str, x_b: torch.Tensor
+    ) -> bool:
+        """True iff this fit should run through the chunked CUDA-tensor EM
+        path. The path runs torch_fallback's batch_gmm_*_torch_native on
+        a CUDA tensor — large-shape coverage that the native CUDA kernels
+        don't support, plus mid-K shapes (K >= 128) where chunked beats
+        native by avoiding the (B, N, K) resp materialization. Reports
+        back as backend='cuda' with cuda_tensor_streamed_enabled=True.
+
+        Conditions:
+          - User-requested backend is auto/cuda (env-resolved)
+          - approx_top_k is None (the streamed path doesn't implement it)
+          - Input is on CUDA
+          - Shape is in the streamed-fit window for this covariance type
+          - Either native doesn't support the shape, or K >= 128 (mid+).
+            For K < 128 in-window the native path is faster; the streamed
+            path takes over at K = 128 even when native still fits.
+        """
+        backend = self.backend
+        if backend == "auto":
+            env_backend = os.environ.get("GMMXX_BACKEND")
+            if env_backend in {"cuda", "auto"}:
+                pass  # streamed-cuda is allowed
+            elif env_backend in {"triton", "torch"}:
+                return False
+        if backend not in {"auto", "cuda"}:
+            return False
+        if self.approx_top_k is not None:
+            return False
+        if not x_b.is_cuda:
+            return False
+        d = int(x_b.shape[-1])
+        from ._runtime import (
+            cuda_diag_supported,
+            cuda_tied_supported,
+            cuda_full_supported,
+        )
+        if covariance_type == "diag":
+            if not cuda_diag_streamed_supported(d, self.k, x_b.dtype):
+                return False
+            return (not cuda_diag_supported(d, self.k, x_b.dtype)) or self.k >= 128
+        if covariance_type == "tied":
+            if not cuda_tied_streamed_supported(d, self.k, x_b.dtype):
+                return False
+            return (not cuda_tied_supported(d, self.k, x_b.dtype)) or self.k >= 128
+        if covariance_type == "full":
+            if not cuda_full_streamed_supported(d, self.k, x_b.dtype):
+                return False
+            return (not cuda_full_supported(d, self.k, x_b.dtype)) or self.k >= 128
+        return False
+
+    def _cuda_tensor_streamed_chunk_sizes(
+        self, covariance_type: str, x_b: torch.Tensor
+    ) -> tuple[int, int]:
+        """Autotuned (chunk_size_N, chunk_size_K) for the streamed-CUDA path.
+
+        Defaults are inherited from self.chunk_size_data /
+        self.chunk_size_centroids; for the large-K diag/tied window with
+        bf16/fp16 inputs we narrow chunk_size_N to keep the (chunk_size_N,
+        K, D) intermediates inside L2 / SMEM friendly bounds.
+        """
+        chunk_n = int(self.chunk_size_data)
+        chunk_k = int(self.chunk_size_centroids)
+        if (
+            covariance_type in {"diag", "tied"}
+            and x_b.dtype in (torch.float16, torch.bfloat16)
+            and chunk_n >= 32768
+            and self.k >= 1024
+            and int(x_b.shape[-1]) >= 128
+        ):
+            chunk_n = 16384
+            if chunk_k >= 1024:
+                chunk_k = 512
+        return chunk_n, chunk_k
+
+    def _set_cuda_tensor_streamed_result(
+        self,
+        *,
+        labels_b,
+        means_b,
+        variances_b,
+        weights_b,
+        info,
+        batch_size,
+        chunk_size_n: int,
+        chunk_size_k: int,
+        n_iter: int,
+    ) -> None:
+        """Persist a streamed-CUDA-tensor fit result. Mirrors
+        _set_fit_result but stamps backend='cuda' and the streamed-path
+        fit_info_ keys regardless of what the underlying torch_native
+        function reported (it doesn't know which dispatch wrapper called
+        it)."""
+        info = dict(info)
+        info["backend_breakdown"] = {"cuda": int(n_iter)}
+        info["cuda_tensor_streamed_enabled"] = True
+        info["cuda_tensor_streamed_chunk_size_N"] = int(chunk_size_n)
+        info["cuda_tensor_streamed_chunk_size_K"] = int(chunk_size_k)
+        self._set_fit_result(
+            labels_b=labels_b,
+            means_b=means_b,
+            variances_b=variances_b,
+            weights_b=weights_b,
+            info=info,
+            batch_size=batch_size,
+        )
+        self.last_backend_used_ = "cuda"
+        self.cuda_estep_enabled_ = True
 
     def _train_spherical_cuda(self, x_b: torch.Tensor, batch_size: Optional[int]) -> None:
         """Spherical EM loop on the CUDA backend (Plan 2 safe path).
@@ -962,7 +1095,13 @@ class GMMXX:
         )
 
     def train(self, data: torch.Tensor):
-        self._apply_matmul_precision()
+        prev_matmul_prec = self._apply_matmul_precision()
+        try:
+            return self._train_impl(data)
+        finally:
+            self._restore_matmul_precision(prev_matmul_prec)
+
+    def _train_impl(self, data: torch.Tensor):
         self._reset_fit_state()
         x_b, batch_size = self._normalize_input(data)
 
@@ -1020,6 +1159,34 @@ class GMMXX:
                 approx_top_k=self.approx_top_k,
             )
         elif self.covariance_type == "diag":
+            # Streamed CUDA-tensor dispatch — for shapes outside the native
+            # CUDA window but inside the streamed window, run torch_fallback
+            # on a CUDA tensor and report the fit as backend='cuda' /
+            # cuda_tensor_streamed_enabled.
+            if self._can_use_cuda_tensor_streamed_fit("diag", x_b):
+                chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes("diag", x_b)
+                labels_b, means_b, variances_b, weights_b, info = (
+                    batch_gmm_Diagonal_torch_native(
+                        x_b, self.k,
+                        max_iters=self.niter, tol=self.tol, verbose=self.verbose,
+                        init_params=self.init_params, reg_covar=self.reg_covar,
+                        chunk_size_N=chunk_n, chunk_size_K=chunk_k,
+                        kmeans_init_iters=self.init_kmeans_iters,
+                        kmeans_init_tol=self.init_kmeans_tol,
+                        kmeans_use_triton=self.use_triton,
+                        gmm_use_triton="auto" if self.use_triton else False,
+                        compute_labels=self.compute_labels_on_fit,
+                        approx_top_k=self.approx_top_k,
+                    )
+                )
+                self._set_cuda_tensor_streamed_result(
+                    labels_b=labels_b, means_b=means_b,
+                    variances_b=variances_b, weights_b=weights_b,
+                    info=info, batch_size=batch_size,
+                    chunk_size_n=chunk_n, chunk_size_k=chunk_k,
+                    n_iter=int(info.get("n_iter", self.niter)),
+                )
+                return
             # CUDA backend dispatch — when resolver picks "cuda", run the
             # standalone EM loop in _train_diag_cuda and return early.
             # The CUDA path does not implement approximate top-k EM, so
@@ -1065,6 +1232,31 @@ class GMMXX:
                 approx_top_k=self.approx_top_k,
             )
         elif self.covariance_type == "tied":
+            # Streamed CUDA-tensor dispatch (see diag branch comment above).
+            if self._can_use_cuda_tensor_streamed_fit("tied", x_b):
+                chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes("tied", x_b)
+                labels_b, means_b, variances_b, weights_b, info = (
+                    batch_gmm_Tied_torch_native(
+                        x_b, self.k,
+                        max_iters=self.niter, tol=self.tol, verbose=self.verbose,
+                        init_params=self.init_params, reg_covar=self.reg_covar,
+                        chunk_size_N=chunk_n, chunk_size_K=chunk_k,
+                        kmeans_init_iters=self.init_kmeans_iters,
+                        kmeans_init_tol=self.init_kmeans_tol,
+                        kmeans_use_triton=self.use_triton,
+                        gmm_use_triton="auto" if self.use_triton else False,
+                        compute_labels=self.compute_labels_on_fit,
+                        approx_top_k=self.approx_top_k,
+                    )
+                )
+                self._set_cuda_tensor_streamed_result(
+                    labels_b=labels_b, means_b=means_b,
+                    variances_b=variances_b, weights_b=weights_b,
+                    info=info, batch_size=batch_size,
+                    chunk_size_n=chunk_n, chunk_size_k=chunk_k,
+                    n_iter=int(info.get("n_iter", self.niter)),
+                )
+                return
             # CUDA backend dispatch — when resolver picks "cuda", run the
             # standalone EM loop in _train_tied_cuda and return early.
             # The CUDA path does not implement approximate top-k EM, so
@@ -1110,6 +1302,31 @@ class GMMXX:
             )
         else:
             # covariance_type == "full"
+            # Streamed CUDA-tensor dispatch (see diag branch comment above).
+            if self._can_use_cuda_tensor_streamed_fit("full", x_b):
+                chunk_n, chunk_k = self._cuda_tensor_streamed_chunk_sizes("full", x_b)
+                labels_b, means_b, variances_b, weights_b, info = (
+                    batch_gmm_Full_torch_native(
+                        x_b, self.k,
+                        max_iters=self.niter, tol=self.tol, verbose=self.verbose,
+                        init_params=self.init_params, reg_covar=self.reg_covar,
+                        chunk_size_N=chunk_n, chunk_size_K=chunk_k,
+                        kmeans_init_iters=self.init_kmeans_iters,
+                        kmeans_init_tol=self.init_kmeans_tol,
+                        kmeans_use_triton=self.use_triton,
+                        gmm_use_triton="auto" if self.use_triton else False,
+                        compute_labels=self.compute_labels_on_fit,
+                        approx_top_k=self.approx_top_k,
+                    )
+                )
+                self._set_cuda_tensor_streamed_result(
+                    labels_b=labels_b, means_b=means_b,
+                    variances_b=variances_b, weights_b=weights_b,
+                    info=info, batch_size=batch_size,
+                    chunk_size_n=chunk_n, chunk_size_k=chunk_k,
+                    n_iter=int(info.get("n_iter", self.niter)),
+                )
+                return
             # CUDA backend dispatch — when resolver picks "cuda", run the
             # standalone EM loop in _train_full_cuda and return early.
             # The CUDA path does not implement approximate top-k EM, so
