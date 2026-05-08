@@ -321,8 +321,13 @@ def soft_update_spherical(
                         # the bias-add into the cuBLAS GEMM epilogue (single
                         # kernel, fp32 accumulation internal). This is ~3x
                         # faster than mm(bf16)+cast+add separately on Ada.
-                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).transpose(-1, -2).contiguous()
-                        alpha_bf16 = alpha[0].to(torch.bfloat16).contiguous()
+                        # Exp84: build the bf16 transposed view directly via
+                        # transpose(0, 1).contiguous() chained on the (K, D1)
+                        # cast, which produces a contiguous (D1, K) tensor in
+                        # one kernel — saves the transpose-then-contiguous
+                        # double launch.
+                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).t().contiguous()
+                        alpha_bf16 = alpha[0].to(torch.bfloat16)
 
                     # Exp78: persistent-CTA Triton kernel — processes the full
                     # N range in one launch with a per-CTA partial accumulator
