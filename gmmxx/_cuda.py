@@ -17,6 +17,7 @@ the `gmmxx.cuda_ops` re-export.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -114,23 +115,45 @@ def _spherical_logits_torch(x: torch.Tensor, means: torch.Tensor,
     return log_w.unsqueeze(1) - log_norm_const - 0.5 * dist / var.unsqueeze(1)
 
 
+@dataclass
+class _SphericalChunkedInputs:
+    """Per-fit (loop-invariant) inputs to _run_chunked_cublas_estep.
+
+    Bundled into a dataclass to keep the function signature manageable;
+    these tensors are built once at fit setup and shared across every
+    EM iter.
+    """
+    x: torch.Tensor
+    x_aug_cached: torch.Tensor
+    x_estep_aug_cached: torch.Tensor
+    x_estep_aug_bf16_cached: Optional[torch.Tensor]
+    x_aug_bf16_cached: Optional[torch.Tensor]
+    persistent_partial_buf: Optional[torch.Tensor]
+
+
+@dataclass
+class _SphericalIterPrep:
+    """Per-iter outputs of the prepare_spherical_estep kernels.
+
+    The fp32 (alpha, means_aug) form drives the cuBLAS chunked-loop
+    fallback path; the bf16 + transposed form drives the persistent-CTA
+    kernel. One or both may be None at the start of each iter — the
+    chunked-loop helper lazy-builds the fp32 form if a fallback path
+    runs.
+    """
+    alpha: Optional[torch.Tensor]
+    means_aug: Optional[torch.Tensor]
+    alpha_bf16: Optional[torch.Tensor]
+    means_aug_t_bf16: Optional[torch.Tensor]
+
+
 def _run_chunked_cublas_estep(
     *,
-    x: torch.Tensor,
+    inputs: _SphericalChunkedInputs,
     means_f: torch.Tensor,
     var: torch.Tensor,
     log_w: torch.Tensor,
-    x_aug_cached: torch.Tensor,
-    x_estep_aug_cached: torch.Tensor,
-    x_estep_aug_bf16_cached: Optional[torch.Tensor],
-    x_aug_bf16_cached: Optional[torch.Tensor],
-    persistent_partial_buf: Optional[torch.Tensor],
-    alpha_pre,
-    means_aug_pre,
-    alpha_bf16_pre,
-    means_aug_t_bf16_pre,
-    K_dim: int,
-    N_total: int,
+    prep: _SphericalIterPrep,
     compute_lse: bool,
     compute_ids: bool,
 ):
@@ -140,16 +163,27 @@ def _run_chunked_cublas_estep(
     Picks the best available implementation for this iter:
       1. Persistent-CTA Triton kernel (full-N single launch, requires bf16
          cache, no lse/ids, N>=65536).
-      2. Per-chunk Triton fused addmm+softmax + cuBLAS baddbmm.
-      3. Per-chunk cuBLAS addmm bf16 + torch.softmax + cuBLAS baddbmm.
-      4. Per-chunk cuBLAS addmm fp32 (when no bf16 cache).
+      2. Per-chunk cuBLAS addmm bf16 + torch.softmax + cuBLAS baddbmm.
+      3. Per-chunk cuBLAS addmm fp32 (when no bf16 cache).
 
     Returns (sum_aug (B,K,D+2) fp32, lse_full or None, ids_full or None,
     alpha_fp32_lazy_or_orig, means_aug_fp32_lazy_or_orig). The last two
     are returned so the caller can reuse the lazy-built fp32 outputs if
     its later epilogue branches need them.
     """
+    x = inputs.x
+    x_aug_cached = inputs.x_aug_cached
+    x_estep_aug_cached = inputs.x_estep_aug_cached
+    x_estep_aug_bf16_cached = inputs.x_estep_aug_bf16_cached
+    x_aug_bf16_cached = inputs.x_aug_bf16_cached
+    persistent_partial_buf = inputs.persistent_partial_buf
+    alpha = prep.alpha
+    means_aug = prep.means_aug
+    alpha_bf16_pre = prep.alpha_bf16
+    means_aug_t_bf16_pre = prep.means_aug_t_bf16
     B = x.shape[0]
+    K_dim = means_f.shape[1]
+    N_total = x_estep_aug_cached.shape[1]
     Dp2 = x_aug_cached.shape[2]
 
     # 16 MB target. cuBLAS addmm-bf16 collapses the per-chunk E-step into
@@ -173,9 +207,6 @@ def _run_chunked_cublas_estep(
         torch.empty((B, N_total), dtype=torch.int32, device=x.device)
         if compute_ids else None
     )
-
-    alpha = alpha_pre
-    means_aug = means_aug_pre
 
     # bf16 alpha/means_aug for the cuBLAS bf16 addmm and the persistent kernel.
     alpha_bf16 = None
@@ -487,21 +518,23 @@ def soft_update_spherical(
                 if _use_chunked:
                     sum_aug, lse_full, ids_full, alpha, means_aug = (
                         _run_chunked_cublas_estep(
-                            x=x,
+                            inputs=_SphericalChunkedInputs(
+                                x=x,
+                                x_aug_cached=x_aug_cached,
+                                x_estep_aug_cached=x_estep_aug_cached,
+                                x_estep_aug_bf16_cached=x_estep_aug_bf16_cached,
+                                x_aug_bf16_cached=x_aug_bf16_cached,
+                                persistent_partial_buf=persistent_partial_buf,
+                            ),
                             means_f=means_f,
                             var=var,
                             log_w=log_w,
-                            x_aug_cached=x_aug_cached,
-                            x_estep_aug_cached=x_estep_aug_cached,
-                            x_estep_aug_bf16_cached=x_estep_aug_bf16_cached,
-                            x_aug_bf16_cached=x_aug_bf16_cached,
-                            persistent_partial_buf=persistent_partial_buf,
-                            alpha_pre=alpha,
-                            means_aug_pre=means_aug,
-                            alpha_bf16_pre=alpha_bf16_pre,
-                            means_aug_t_bf16_pre=means_aug_t_bf16_pre,
-                            K_dim=K_dim,
-                            N_total=_N_total,
+                            prep=_SphericalIterPrep(
+                                alpha=alpha,
+                                means_aug=means_aug,
+                                alpha_bf16=alpha_bf16_pre,
+                                means_aug_t_bf16=means_aug_t_bf16_pre,
+                            ),
                             compute_lse=compute_lse,
                             compute_ids=compute_ids,
                         )
