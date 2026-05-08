@@ -1709,7 +1709,7 @@ at::Tensor assign_sm80(
                 x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
             return true;
         }
-        // Exp59: BLOCK_N=128, BLOCK_K=32, WARPS=4. Halves c_smem vs (128,64,4)
+        // BLOCK_N=128, BLOCK_K=32, WARPS=4. Halves c_smem vs (128,64,4)
         // when K<=32, raising max-CTAs-per-SM and shrinking the per-CTA SMEM
         // footprint. For K=32 shapes the BK=64 tile wastes half its SMEM.
         if (bn == 128 && bk == 32 && warps == 4) {
@@ -1726,7 +1726,7 @@ at::Tensor assign_sm80(
         return false;
     };
 
-    // Exp59: prefer (128, 32, 4) when K is small enough that BK=64 would be
+    // Prefer (128, 32, 4) when K is small enough that BK=64 would be
     // half-empty. Falls through to the legacy ladder otherwise.
     bool launched = false;
     if (x.scalar_type() == at::kHalf) {
@@ -1808,7 +1808,7 @@ at::Tensor logsumexp_sm80(
                 x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
             return true;
         }
-        // Exp59: small-K-friendly tile (see assign_sm80 dispatch comment).
+        // Small-K-friendly tile (see assign_sm80 dispatch comment).
         if (bn == 128 && bk == 32 && warps == 4) {
             launch_logsumexp_sm80_typed<T, 128, 32, 4>(
                 x, means, var, log_w, x_sq, c_sq, result, B, N, K, D, stream);
@@ -1907,7 +1907,7 @@ at::Tensor resp_sm80(
                 B, N, K, D, stream);
             return true;
         }
-        // Exp59: small-K-friendly tile (see assign_sm80 dispatch comment).
+        // Small-K-friendly tile (see assign_sm80 dispatch comment).
         if (bn == 128 && bk == 32 && warps == 4) {
             launch_resp_sm80_typed<T, 128, 32, 4>(
                 x, means, var, log_w, x_sq, c_sq, log_norm, result,
@@ -1952,7 +1952,7 @@ at::Tensor resp_sm80(
 }
 
 // ------------------------------------------------------------------
-// Public API: logsumexp_resp_sm80 (Exp62 — fused E-step kernel)
+// Public API: logsumexp_resp_sm80 — fused E-step kernel
 //
 // Returns (lse, resp) in one kernel launch. Constraint: K must be <=
 // BLOCK_K of the chosen tile (the kernel only does one K-chunk).

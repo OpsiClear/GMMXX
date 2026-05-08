@@ -1,4 +1,4 @@
-"""Exp70: Triton kernel that fuses addmm bf16 + softmax for the spherical
+"""Triton kernel that fuses addmm bf16 + softmax for the spherical
 chunked path. Skips the logits materialization that currently sits between
 the cuBLAS bf16 GEMM and the torch softmax launch. Output is resp fp32
 which feeds straight into torch.baddbmm.

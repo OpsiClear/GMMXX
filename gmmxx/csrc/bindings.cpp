@@ -77,7 +77,7 @@ NB_MODULE(_C, m) {
         nb::arg("log_w"),
         nb::arg("means"),
         nb::arg("var"),
-        "Exp85 bf16 + transposed variant of prepare_spherical_estep. Returns "
+        "bf16 + transposed variant of prepare_spherical_estep. Returns "
         "(alpha_bf16 (B,K), means_aug_t_bf16 (B,D+1,K)) — the exact layout the "
         "persistent-CTA Triton kernel needs, so the Python wrapper avoids the "
         "(.to(bf16), .t(), .contiguous()) chain (~25 μs/iter saved).");
@@ -92,7 +92,7 @@ NB_MODULE(_C, m) {
         nb::arg("x_sq"),
         nb::arg("c_sq"),
         nb::arg("need_lse"),
-        "Exp62 fused E-step: returns (lse (B,N) or empty if !need_lse, "
+        "Fused E-step: returns (lse (B,N) or empty if !need_lse, "
         "resp (B,N,K)) in one sm80 mma kernel launch — saves the "
         "redundant GEMM that the separate logsumexp+resp pipeline runs. "
         "Constraint: K must fit in one BLOCK_K of an available tile "

@@ -50,7 +50,7 @@ prepare_spherical_estep_kernel(
     alpha[bk] = log_w[bk] - half_d * (LOG_2PI + logf(v)) - 0.5f * c_sq * inv_var;
 }
 
-// Exp85: bf16 variant that writes means_aug directly in (D+1, K) bf16 layout
+// bf16 variant that writes means_aug directly in (D+1, K) bf16 layout
 // for the persistent-CTA Triton kernel. One thread per (b, k) computes alpha
 // and the per-cluster (D+1) means_aug column; writes are scattered across the
 // transposed output (k stride = 1, d stride = K) so consecutive threads

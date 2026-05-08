@@ -1,7 +1,8 @@
-"""Exp78: Persistent-CTA Triton kernel that processes the full N range
-of a chunk in one launch, accumulating the (K, D+2) partial in
-register/shared-memory across BLOCK_N row tiles. Eliminates the
-per-row-tile baddbmm and the resp gmem round-trip.
+"""Persistent-CTA Triton kernel for the spherical EM chunked fastpath.
+
+Processes the full N range of a chunk in one launch, accumulating the
+(K, D+2) partial in register/shared-memory across BLOCK_N row tiles.
+Eliminates the per-row-tile baddbmm and the resp gmem round-trip.
 
 Each CTA owns a contiguous N range. Inside, the kernel iterates over
 its range in tiles of BLOCK_N, doing the full E-step (bf16 GEMM +
@@ -141,7 +142,7 @@ def persistent_em_iter(
     `x_aug` accepts either fp32 OR bf16. The kernel branches on dtype
     via a constexpr:
       bf16: tl.dot(resp_bf16, x_aug_bf16) — HMMA, fp32 accumulator,
-            ~2x faster on Ada (Exp80).
+            ~2x faster on Ada.
       fp32: tl.dot(resp_fp32, x_aug_fp32) — TF32, fp32 accumulator.
     The fp32 path is the fallback when no bf16 cache is available.
     Other dtypes (fp16, fp64) are not supported.

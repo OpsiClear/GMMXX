@@ -477,13 +477,13 @@ class GMMXX:
         # Decide once per fit() whether the fused path is available for this
         # (D, K, dtype). Approx-topK is a separate soft-EM approximation and
         # intentionally disables the exact fused path.
-        # Exp3: fused kernel is SIMT-only (no sm80 mma); for fp16/bf16 the
-        # separate sm80-mma E-step + soft M-step path beats fused-SIMT by
-        # leveraging tensor cores via cuBLAS / mma.sync.
-        # Exp13: for fp32 with D >= 16 the cuBLAS GEMM fastpath inside
-        # spherical_logsumexp/_resp uses TF32 tensor cores and beats the
-        # SIMT fused kernel. Disable fused there so we route through
-        # use_soft_update -> cuBLAS path.
+        # The fused kernel is SIMT-only (no sm80 mma). For fp16/bf16 the
+        # separate sm80-mma E-step + soft M-step path wins because it
+        # leverages tensor cores via cuBLAS / mma.sync. For fp32 with
+        # D >= 16 the cuBLAS GEMM fastpath inside spherical_logsumexp/
+        # _resp uses TF32 tensor cores and also beats the SIMT fused
+        # kernel — disable fused in that window and route through
+        # use_soft_update -> cuBLAS instead.
         from . import _cuda as _cm_local
         cublas_fastpath = (
             x_b.dtype == torch.float32
@@ -542,11 +542,11 @@ class GMMXX:
                 [x_f_cached, x_sq_cached.unsqueeze(-1), ones_col], dim=-1
             ).contiguous()
             # E-step augmented input: (B, N, D+1) = [x_f | x_sq]. The first
-            # D+1 cols of x_aug are exactly [x_f | x_sq], so we can take a
-            # strided slice of x_aug instead of building a second N*(D+1)*4
-            # tensor. Exp68 saves ~270 MB write at fit setup for the D=128
-            # bench shape and a corresponding cat launch. cuBLAS GEMM on a
-            # strided 2D tensor (lda = D+2, cols = D+1) is equally fast.
+            # D+1 cols of x_aug are exactly [x_f | x_sq], so we take a
+            # strided slice instead of building a second N*(D+1)*4 tensor.
+            # Saves ~270 MB write at fit setup for the D=128 bench shape and
+            # a corresponding cat launch. cuBLAS GEMM on a strided 2D tensor
+            # (lda = D+2, cols = D+1) is equally fast.
             x_estep_aug_cached = x_aug_cached[:, :, :-1]
             # For D >= 64, the E-step GEMM is bandwidth-bound at fp32. Pre-
             # cast a bf16 copy; cuBLAS HMMA with fp32 accumulator halves
@@ -555,7 +555,7 @@ class GMMXX:
                 x_estep_aug_bf16_cached = (
                     x_estep_aug_cached.to(torch.bfloat16).contiguous()
                 )
-                # Exp80: also pre-cast the (B, N, D+2) x_aug as bf16 for the
+                # Also pre-cast the (B, N, D+2) x_aug as bf16 for the
                 # persistent-CTA Triton kernel's M-step partial GEMM. The
                 # kernel does tl.dot(bf16, bf16) with fp32 accumulator,
                 # halving the x_aug read BW vs fp32 (276 MB -> 138 MB at the

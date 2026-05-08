@@ -318,34 +318,32 @@ def soft_update_spherical(
                 # Threshold: chunk when full (N*K) fp32 > 64 MB. The 72 MB
                 # L2 on Ada can hold smaller chunks across the softmax->bmm
                 # hop; chunking below ~64 MB is mostly launch overhead.
-                # Exp66: keep chunked path on the last iter too (when lse
+                # Keep chunked path active on the last iter too (when lse
                 # and/or ids are needed). Per-chunk lse_chunk and ids_chunk
                 # are written into pre-allocated (B,N) buffers so we still
                 # avoid materializing the full (B,N,K) resp tensor.
-                # Exp71: lower the chunked threshold to 8 MB so even small-
-                # N cells (small grid D=128 K=64 N=65k = 16 MB) hit the
-                # chunked path, which now uses Exp70's Triton fused
-                # addmm+softmax. The non-chunked branch is left for shapes
-                # that fit in a single chunk anyway (chunk_size will equal
-                # _N_total).
+                # Threshold is 8 MB so mid-N cells (small grid
+                # D=128 K=64 N=65k = 16 MB) also hit the Triton fused
+                # addmm+softmax inside the chunked path. The non-chunked
+                # branch is left for shapes that fit in a single chunk
+                # anyway (chunk_size will equal _N_total).
                 _use_chunked = (
                     B == 1 and x_aug_cached is not None
                     and _full_resp_mb >= 8
                 )
                 if _use_chunked:
                     # Chunked: per-chunk logits, softmax, bmm partial → accumulate.
-                    # Exp65: 16 MB target (was 32 MB pre-Exp64). With Exp64's
-                    # addmm bf16 epilogue collapsing the per-chunk E-step into
-                    # one cuBLAS call, the per-chunk launch overhead dropped
+                    # 16 MB target. cuBLAS addmm-bf16 collapses the per-chunk
+                    # E-step into one launch, so per-chunk launch overhead is
                     # below the L2-pressure win from smaller chunks. Sweep on
-                    # D=128 K=64 N=524k fp32 had 16 MB best at 32.5 ms vs 34.8
-                    # ms at 32 MB and 40.3 ms at 64 MB.
+                    # D=128 K=64 N=524k fp32 had 16 MB best at 32.5 ms vs
+                    # 34.8 ms at 32 MB and 40.3 ms at 64 MB.
                     target_chunk_bytes = 16 * 1024 * 1024
                     chunk_size = max(65536, target_chunk_bytes // (K_dim * 4))
                     Dp2 = x_aug_cached.shape[2]
-                    # Exp77: torch.empty + first-chunk beta=0 skip the
-                    # zero-write kernel (~2 μs/iter) — baddbmm with beta=0
-                    # ignores the input tensor entirely on the first chunk.
+                    # torch.empty + first-chunk beta=0 skips the zero-write
+                    # kernel (~2 μs/iter) — baddbmm with beta=0 ignores the
+                    # input tensor entirely on the first chunk.
                     sum_aug_acc = torch.empty(
                         (B, K_dim, Dp2), dtype=torch.float32, device=x.device
                     )
@@ -370,10 +368,10 @@ def soft_update_spherical(
                                 _means_alpha_to_bf16_t(alpha, means_aug)
                             )
 
-                    # Exp78: persistent-CTA Triton kernel — processes the full
-                    # N range in one launch with a per-CTA partial accumulator
-                    # held across BLOCK_N tiles, then reduces 128 partials.
-                    # Bypasses the chunked Python loop entirely.
+                    # Persistent-CTA Triton kernel processes the full N range
+                    # in one launch with a per-CTA partial accumulator held
+                    # across BLOCK_N tiles, then reduces 256 partials. Bypasses
+                    # the chunked Python loop entirely when conditions allow.
                     _persistent_taken = False
                     if (
                         x_estep_aug_bf16_cached is not None
@@ -382,9 +380,9 @@ def soft_update_spherical(
                     ):
                         try:
                             from .persistent_em_chunk_triton import persistent_em_iter
-                            # Exp80: pass bf16 x_aug when available — the
-                            # kernel uses tl.dot(bf16, bf16) with fp32
-                            # accumulator, halving x_aug read BW.
+                            # Pass bf16 x_aug when available — the kernel uses
+                            # tl.dot(bf16, bf16) with fp32 accumulator,
+                            # halving x_aug read BW vs the fp32 path.
                             _x_aug_for_kernel = (
                                 x_aug_bf16_cached[0]
                                 if x_aug_bf16_cached is not None
@@ -403,7 +401,7 @@ def soft_update_spherical(
                         except Exception:
                             _persistent_taken = False
 
-                    # Exp70: Triton kernel fuses the per-chunk bf16 GEMM with
+                    # Triton kernel fuses the per-chunk bf16 GEMM with
                     # softmax, skipping the (chunk_n, K) fp32 logits write.
                     # Only the no-lse / no-ids fast path uses it; lse/ids
                     # iters need the materialized logits.
@@ -457,7 +455,7 @@ def soft_update_spherical(
                             if compute_ids:
                                 ids_full[:, n_start:n_end] = logits_chunk.argmax(dim=-1).to(torch.int32)
                             resp_chunk = torch.softmax(logits_chunk, dim=-1)
-                        # Exp67/77: baddbmm fuses bmm + add into the cuBLAS GEMM
+                        # baddbmm fuses bmm + add into the cuBLAS GEMM
                         # beta-epilogue. First chunk uses beta=0 so the
                         # uninitialized sum_aug_acc is overwritten without
                         # requiring a separate zero_() call.
@@ -520,15 +518,15 @@ def soft_update_spherical(
                 lse = logits.logsumexp(dim=-1) if compute_lse else None
             # else: chunked path already produced sum_aug; resp / lse are None
         else:
-            # Exp56: cache x_sq (constant across the EM loop) and compute c_sq
-            # once locally so the dispatcher does not redo .to(float).pow(2).sum
-            # twice per iter (in logsumexp + in resp).
+            # Cache x_sq (constant across the EM loop) and compute c_sq
+            # once locally so the dispatcher does not redo
+            # .to(float).pow(2).sum twice per iter (in logsumexp + in resp).
             x_sq_for_kernel = x_sq.contiguous() if x_sq is not None else None
             c_sq_for_kernel = (
                 means.float().pow(2).sum(-1).contiguous()
                 if means.is_contiguous() else None
             )
-            # Exp62: try the fused logsumexp+resp sm80 kernel first (one
+            # Try the fused logsumexp+resp sm80 kernel first (one
             # GEMM-equivalent + one launch instead of two). The kernel only
             # handles K <= BLOCK_K of the smallest available tile (64 here),
             # and returns empty tensors as a sentinel when no tile fits —
@@ -558,7 +556,7 @@ def soft_update_spherical(
                 )
                 if not compute_lse:
                     lse = None
-        # Exp66: when chunked branch already populated ids in-line (resp is
+        # When the chunked branch already populated ids in-line (resp is
         # None then), keep it. Otherwise compute argmax from resp now.
         if resp is not None:
             ids = resp.argmax(dim=-1).to(torch.int32) if compute_ids else None
@@ -583,7 +581,7 @@ def soft_update_spherical(
         # bmm M-step always produces) and emits fp32 means/var/weights in one
         # launch — replacing ~12 small (B,K) torch ops. For fp16/bf16 input
         # we cast means_new back after the kernel; that's still cheaper than
-        # the eager small-op chain. Exp55.
+        # the eager small-op chain.
         if sum_x.dtype == torch.float32 and means.is_contiguous() and var.is_contiguous():
             sum_x_c = sum_x.contiguous()
             sum_x_sq_c = sum_x_sq.contiguous()

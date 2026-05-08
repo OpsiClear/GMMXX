@@ -90,7 +90,7 @@ std::tuple<at::Tensor, at::Tensor> prepare_estep(
     const at::Tensor& means,
     const at::Tensor& var);
 
-// Exp85: prepare_estep variant that emits bf16 outputs in the layout the
+// prepare_estep variant that emits bf16 outputs in the layout the
 // persistent-CTA Triton kernel needs:
 //   alpha_bf16: (B, K) bf16
 //   means_aug_t_bf16: (B, D+1, K) bf16, contiguous — transposed M-step input.
@@ -102,7 +102,7 @@ std::tuple<at::Tensor, at::Tensor> prepare_estep_bf16_t(
     const at::Tensor& means,
     const at::Tensor& var);
 
-// Exp62: fused logsumexp + resp sm80 kernel.
+// Fused logsumexp + resp sm80 kernel.
 // Returns (lse, resp). lse is empty when need_lse is false. If no tile fits
 // (e.g. K > BLOCK_K of every available tile), returns two empty tensors —
 // caller must fall back to the separate logsumexp+resp pipeline.

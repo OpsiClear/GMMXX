@@ -43,7 +43,7 @@ at::Tensor logsumexp(const at::Tensor& x, const at::Tensor& means,
                      c10::optional<at::Tensor> x_sq_opt,
                      c10::optional<at::Tensor> c_sq_opt) {
     if (_can_use_sm80(x)) {
-        // Exp56: callers running the soft-EM loop can hoist x_sq/c_sq once per
+        // Callers running the soft-EM loop can hoist x_sq/c_sq once per
         // fit (x_sq) or once per iter (c_sq) and pass them in, avoiding the
         // .to(float).pow(2).sum(-1) recompute that fires twice per iter
         // (logsumexp + resp) on the sm80 path.
