@@ -73,6 +73,17 @@ NB_MODULE(_C, m) {
         "torch ops in the soft-EM E-step prep block.");
 
     m.def(
+        "prepare_spherical_estep_bf16_t",
+        &gmmxx::estep::spherical::prepare_estep_bf16_t,
+        nb::arg("log_w"),
+        nb::arg("means"),
+        nb::arg("var"),
+        "Exp85 bf16 + transposed variant of prepare_spherical_estep. Returns "
+        "(alpha_bf16 (B,K), means_aug_t_bf16 (B,D+1,K)) — the exact layout the "
+        "persistent-CTA Triton kernel needs, so the Python wrapper avoids the "
+        "(.to(bf16), .t(), .contiguous()) chain (~25 μs/iter saved).");
+
+    m.def(
         "spherical_logsumexp_resp_sm80",
         &gmmxx::estep::spherical::logsumexp_resp_sm80,
         nb::arg("x"),

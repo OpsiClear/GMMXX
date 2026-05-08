@@ -266,6 +266,24 @@ def soft_update_spherical(
                 # Custom CUDA kernel fuses ~10 small (B,K) torch ops into
                 # a single launch: alpha + means_aug build.
                 alpha, means_aug = _C.prepare_spherical_estep(log_w, means_f, var)
+                # Exp85: also call the bf16+transposed prepare variant when we
+                # will route through the persistent-CTA Triton kernel —
+                # emits the required (D+1, K) bf16 layout in one launch
+                # instead of the fp32 cast + transpose + contiguous chain
+                # later (saves ~20 μs / iter on the bench shape).
+                _emit_bf16_t = (
+                    x_estep_aug_bf16_cached is not None
+                    and not compute_lse and not compute_ids
+                    and B == 1
+                    and hasattr(_C, "prepare_spherical_estep_bf16_t")
+                )
+                if _emit_bf16_t:
+                    alpha_bf16_pre, means_aug_t_bf16_pre = (
+                        _C.prepare_spherical_estep_bf16_t(log_w, means_f, var)
+                    )
+                else:
+                    alpha_bf16_pre = None
+                    means_aug_t_bf16_pre = None
                 # Large-N L2-streaming path: chunk N so per-chunk
                 # logits + resp fit in L2 cache (~72 MB on Ada/Hopper).
                 # Avoids the full (B,N,K) DRAM round-trip on softmax->bmm.
@@ -317,17 +335,15 @@ def soft_update_spherical(
                             (B, _N_total), dtype=torch.int32, device=x.device
                         )
                     if x_estep_aug_bf16_cached is not None:
-                        # Exp64: bf16 alpha + bf16 means_aug + addmm bf16 fuses
-                        # the bias-add into the cuBLAS GEMM epilogue (single
-                        # kernel, fp32 accumulation internal). This is ~3x
-                        # faster than mm(bf16)+cast+add separately on Ada.
-                        # Exp84: build the bf16 transposed view directly via
-                        # transpose(0, 1).contiguous() chained on the (K, D1)
-                        # cast, which produces a contiguous (D1, K) tensor in
-                        # one kernel — saves the transpose-then-contiguous
-                        # double launch.
-                        means_aug_bf16_t = means_aug[0].to(torch.bfloat16).t().contiguous()
-                        alpha_bf16 = alpha[0].to(torch.bfloat16)
+                        # Exp64/84/85: build alpha_bf16 + means_aug_bf16_t.
+                        # When prepare_estep_bf16_t already emitted them
+                        # (Exp85 path), reuse directly; otherwise cast.
+                        if alpha_bf16_pre is not None and means_aug_t_bf16_pre is not None:
+                            alpha_bf16 = alpha_bf16_pre[0]
+                            means_aug_bf16_t = means_aug_t_bf16_pre[0]
+                        else:
+                            means_aug_bf16_t = means_aug[0].to(torch.bfloat16).t().contiguous()
+                            alpha_bf16 = alpha[0].to(torch.bfloat16)
 
                     # Exp78: persistent-CTA Triton kernel — processes the full
                     # N range in one launch with a per-CTA partial accumulator
