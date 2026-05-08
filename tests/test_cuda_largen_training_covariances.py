@@ -216,3 +216,135 @@ def test_largen_cuda_training_auto_falls_back_after_runtime_error(monkeypatch):
 
     assert info.get("backend_breakdown", {}).get("cuda", 0) == 0
     assert "synthetic cuda failure" in info["fallback_reason"]
+
+
+@pytest.mark.parametrize(
+    ("covariance_type", "expected_cov_shape"),
+    [
+        ("diag", (4096, 128)),
+        ("tied", (128, 128)),
+    ],
+)
+def test_gmmxx_flash_sized_diag_tied_in_memory_uses_streamed_cuda(
+    covariance_type, expected_cov_shape
+):
+    from gmmxx import GMMXX
+    from gmmxx._runtime import cuda_diag_streamed_supported, cuda_tied_streamed_supported
+
+    assert cuda_diag_streamed_supported(128, 8192, torch.float16)
+    assert cuda_tied_streamed_supported(128, 8192, torch.float16)
+
+    torch.manual_seed(29)
+    x = torch.randn(256, 128, device="cuda", dtype=torch.float16)
+    model = GMMXX(
+        n_components=4096,
+        covariance_type=covariance_type,
+        backend="cuda",
+        max_iter=1,
+        tol=0.0,
+        random_state=29,
+        init_params="random",
+        dtype=torch.float16,
+        device="cuda",
+        compute_labels_on_fit=False,
+        chunk_size_data=128,
+        chunk_size_centroids=512,
+        matmul_precision="high",
+    ).fit(x)
+
+    assert model.last_backend_used_ == "cuda"
+    assert model.fit_info_["backend_breakdown"] == {"cuda": model.n_iter_}
+    assert model.fit_info_["cuda_tensor_streamed_enabled"] is True
+    assert model.cuda_estep_enabled_ is True
+    assert math.isfinite(model.lower_bound_)
+    assert model.labels_ is None
+    assert model.means_.shape == (4096, 128)
+    assert model.covariances_.shape == expected_cov_shape
+
+
+def test_gmmxx_full_feasible_streamed_cuda_backend():
+    from gmmxx import GMMXX
+    from gmmxx._runtime import cuda_full_streamed_supported
+
+    assert cuda_full_streamed_supported(64, 128, torch.float16)
+    assert not cuda_full_streamed_supported(128, 8192, torch.float16)
+
+    torch.manual_seed(31)
+    x = torch.randn(256, 64, device="cuda", dtype=torch.float16)
+    model = GMMXX(
+        n_components=128,
+        covariance_type="full",
+        backend="cuda",
+        max_iter=1,
+        tol=0.0,
+        random_state=31,
+        init_params="random",
+        dtype=torch.float16,
+        device="cuda",
+        compute_labels_on_fit=False,
+        chunk_size_data=128,
+        chunk_size_centroids=64,
+        matmul_precision="high",
+    ).fit(x)
+
+    assert model.last_backend_used_ == "cuda"
+    assert model.fit_info_["backend_breakdown"] == {"cuda": model.n_iter_}
+    assert model.fit_info_["cuda_tensor_streamed_enabled"] is True
+    assert model.labels_ is None
+    assert math.isfinite(model.lower_bound_)
+    assert model.means_.shape == (128, 64)
+    assert model.covariances_.shape == (128, 64, 64)
+
+
+@pytest.mark.parametrize("covariance_type", ["diag", "tied"])
+def test_gmmxx_mid_k_diag_tied_prefers_streamed_cuda(covariance_type):
+    from gmmxx import GMMXX
+
+    torch.manual_seed(37)
+    x = torch.randn(256, 64, device="cuda", dtype=torch.float16)
+    model = GMMXX(
+        n_components=128,
+        covariance_type=covariance_type,
+        backend="cuda",
+        max_iter=1,
+        tol=0.0,
+        random_state=37,
+        init_params="random",
+        dtype=torch.float16,
+        device="cuda",
+        compute_labels_on_fit=False,
+        chunk_size_data=128,
+        chunk_size_centroids=64,
+        matmul_precision="high",
+    ).fit(x)
+
+    assert model.last_backend_used_ == "cuda"
+    assert model.fit_info_["cuda_tensor_streamed_enabled"] is True
+    assert model.fit_info_["backend_breakdown"] == {"cuda": model.n_iter_}
+    assert model.means_.shape == (128, 64)
+
+
+@pytest.mark.parametrize("covariance_type", ["diag", "tied"])
+def test_gmmxx_large_diag_tied_streamed_cuda_uses_autotuned_chunks(covariance_type):
+    from gmmxx import GMMXX
+
+    torch.manual_seed(41)
+    x = torch.randn(256, 128, device="cuda", dtype=torch.float16)
+    model = GMMXX(
+        n_components=1024,
+        covariance_type=covariance_type,
+        backend="cuda",
+        max_iter=1,
+        tol=0.0,
+        random_state=41,
+        init_params="random",
+        dtype=torch.float16,
+        device="cuda",
+        compute_labels_on_fit=False,
+        matmul_precision="high",
+    ).fit(x)
+
+    assert model.last_backend_used_ == "cuda"
+    assert model.fit_info_["cuda_tensor_streamed_enabled"] is True
+    assert model.fit_info_["cuda_tensor_streamed_chunk_size_N"] == 16384
+    assert model.fit_info_["cuda_tensor_streamed_chunk_size_K"] == 512

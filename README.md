@@ -62,7 +62,7 @@ The wheel contains the canonical `gmmxx` package. `third_party/` is reference co
 
 ### CUDA backend (experimental)
 
-`GMMXX` is migrating to a hand-written CUDA backend. **Spherical covariance is feature-complete on CUDA** (Plans 2–5, 11). For `D ≤ 64, K ≤ 128` shapes the fused single-tile E/M kernel runs in one CTA pass per BLOCK_N rows — logits + softmax + per-cluster sufficient-statistic accumulation in registers/SMEM, four kernel launches reduced to one per EM iteration. For wider shapes (up to `D ≤ 128, K ≤ 2048`), the unfused pipeline (sorted-run atomic-coalesced M-step + sm_80 `mma.sync` E-step for fp16/bf16 + safe SIMT for fp32) is used. Spherical `approx_top_k` training also stays on CUDA for in-memory fits, using a CUDA-resident top-k soft-stat update; values `>= K` still resolve to exact EM. `predict()`, `predict_proba()`, `score_samples()`, `score()` all dispatch to CUDA when `backend="cuda"` and the shape is in the support window. Perf-gated to within 10% of Triton on all supported shapes. Large-N CPU streaming (`batch_gmm_largeN_cpu` and friends) accepts a `backend="cuda"` kwarg: spherical, diag, tied, and full training stream chunks through CUDA E/M kernels inside each support window, and streamed inference dispatches to CUDA for all four covariance types. Diagonal is now on CUDA (Plan 6) — the safe-path E-step + soft-EM M-step + finalize support D ≤ 64, K ≤ 512 for fp32/fp16/bf16. Tied is now on CUDA (Plan 7) — uses projected coordinates `y = L⁻¹ x` to reduce the tied logit to a Euclidean distance, reusing the spherical CUDA kernels with `var=1`, then finalizes soft responsibilities via host Cholesky factorization (`D ≤ 64, K ≤ 512`). Full is now on CUDA (Plan 8) — pure-torch soft-EM orchestration via batched `solve_triangular` + per-cluster `cholesky_ex` for `D ≤ 16, K ≤ 32`. **All four covariance types are now on CUDA.** Follow-up performance plans cover sm_80 mma, sorted-run, and fused kernels for diag/tied/full. See `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md` for the overall design and `docs/superpowers/plans/` for per-PR plans.
+`GMMXX` is migrating to a hand-written CUDA backend. **Spherical covariance is feature-complete on CUDA** (Plans 2–5, 11). For `D ≤ 64, K ≤ 128` shapes the fused single-tile E/M kernel runs in one CTA pass per BLOCK_N rows — logits + softmax + per-cluster sufficient-statistic accumulation in registers/SMEM, four kernel launches reduced to one per EM iteration. For wider shapes (up to `D ≤ 128, K ≤ 8192`), the unfused pipeline (sorted-run atomic-coalesced M-step + sm_80 `mma.sync` E-step for fp16/bf16 + safe SIMT for fp32) is used. Spherical `approx_top_k` training also stays on CUDA for in-memory fits, using a CUDA-resident top-k soft-stat update; values `>= K` still resolve to exact EM. `predict()`, `predict_proba()`, `score_samples()`, `score()` all dispatch to CUDA when `backend="cuda"` and the shape is in the support window. Perf-gated to within 10% of Triton on all supported shapes. Large-N CPU streaming (`batch_gmm_largeN_cpu` and friends) accepts a `backend="cuda"` kwarg: spherical, diag, tied, and full training stream chunks through CUDA E/M kernels inside each support window, and streamed inference dispatches to CUDA for all four covariance types. Diagonal is on CUDA (Plan 6): native kernels are available for `D ≤ 64, K ≤ 512`, while fitting prefers the native path for small `K` and chunked CUDA-tensor soft EM above that; large in-memory CUDA tensors use chunked soft EM up to `D ≤ 128, K ≤ 8192`. Tied is on CUDA (Plan 7): native projected-coordinate kernels are available for `D ≤ 64, K ≤ 512`, while fitting prefers the native path for small `K` and the chunked CUDA-tensor path above that; large in-memory CUDA tensors use chunked soft EM up to `D ≤ 128, K ≤ 8192`. Full is on CUDA (Plan 8): native full covers `D ≤ 16, K ≤ 32`, and bounded chunked CUDA-tensor EM covers larger feasible shapes while rejecting cases whose `K*D*D` covariance state is too large. **All four covariance types have CUDA execution paths, with full covariance bounded to full-friendly shapes.** Follow-up performance plans cover sm_80 mma, sorted-run, and fused kernels for diag/tied/full. See `docs/superpowers/specs/2026-05-02-gmmxx-cuda-backend-design.md` for the overall design and `docs/superpowers/plans/` for per-PR plans.
 
 The CUDA path is selected automatically on hosts with a working build:
 
@@ -160,10 +160,10 @@ Use `use_triton=True` as the single runtime switch. Unsupported shapes, compile 
 
 | Covariance | Parameter shape | CUDA/Triton coverage |
 | --- | --- | --- |
-| `spherical` | `(B, K)` | Fastest path. Exact fused E/M supports up to `D <= 64, K <= 128`; broader streamed/inference paths are used where profitable. |
-| `diag` | `(B, K, D)` | Streamed E/M supports large CUDA shapes up to `D <= 64, K <= 512`; exact fused high-D tile remains conservative at `D <= 64, K <= 64`. |
-| `tied` | `(B, D, D)` | Uses projected or native fused Triton E/M up to `D <= 64, K <= 512`; exact fused tile supports up to `D <= 64, K <= 128`. |
-| `full` | `(B, K, D, D)` | Fit/update uses Triton only for profitable `D <= 8` shapes; inference supports `D <= 16`. |
+| `spherical` | `(B, K)` | Fastest path. Exact fused E/M supports up to `D <= 64, K <= 128`; exact and approximate large-K CUDA paths support up to `D <= 128, K <= 8192`. |
+| `diag` | `(B, K, D)` | Native CUDA kernels cover `D <= 64, K <= 512`; fitting uses native for small `K` and chunked CUDA-tensor EM for larger/flash-kmeans-sized in-memory fits up to `D <= 128, K <= 8192`. |
+| `tied` | `(B, D, D)` | Native CUDA kernels cover `D <= 64, K <= 512`; fitting uses native for small `K` and chunked CUDA-tensor EM for larger/flash-kmeans-sized in-memory fits up to `D <= 128, K <= 8192`. |
+| `full` | `(B, K, D, D)` | Native CUDA covers `D <= 16, K <= 32`; bounded chunked CUDA-tensor EM covers feasible larger shapes up to `D <= 128` while requiring `K*D*D <= 2,000,000`. Flash-kmeans-sized `D=128,K=8192` full covariance is not a practical target. |
 
 ### Useful Options
 
@@ -173,6 +173,8 @@ Use `use_triton=True` as the single runtime switch. Unsupported shapes, compile 
 | `approx_top_k=N` | Approximate training mode. Each E-step keeps the top `N` component logits per sample and normalizes over that subset. `None` keeps exact EM; values `>= K` are treated as exact. Spherical in-memory fits stay on CUDA when `backend="cuda"`. |
 | `compute_labels_on_fit=False` | Skips final label assignment during `fit()`. Use `fit_predict()` or `predict()` when labels are needed. |
 | `matmul_precision="high"` or `"medium"` | Forwards to `torch.set_float32_matmul_precision(...)`; opt-in because it can slightly change floating-point results. |
+
+For large in-memory CUDA tensor fits with diagonal or tied covariance, the default chunk sizes are auto-tuned at `D >= 128, K >= 1024`. Explicit `chunk_size_data` or `chunk_size_centroids` values are always respected.
 
 Approximate top-k EM is training-only and should be quality-checked on your dataset before replacing exact EM.
 
@@ -238,6 +240,9 @@ python benchmarks\benchmark_gmm.py --dataset anisotropic-blobs --n-samples 13107
 
 # Approximate top-k EM
 python benchmarks\benchmark_gmm.py --dataset blobs --n-samples 65536 --n-features 32 --n-components 512 --device cuda --max-iter 2 --init-params random --skip-fit-labels --approx-top-k 16 --baselines flash-auto flash-torch
+
+# Flash-kmeans-sized shape sweep across covariance modes
+python benchmarks\benchmark_flash_kmeans_sizes.py --shapes tiny,small,med,big,huge,mega --covariances all --backends cuda,torch --max-iter 1
 ```
 
 Low-level Triton module benchmark:

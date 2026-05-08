@@ -2058,6 +2058,7 @@ def batch_gmm_Spherical_torch_native(
         )
 
     for iteration in range(max_iters):
+        collect_lower_bound = bool(tol > 0.0 or verbose or iteration + 1 == max_iters)
         variances = variances.clamp_min(reg_covar)
         weights = weights.clamp_min(min_weight)
         weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -2396,6 +2397,7 @@ def batch_gmm_Spherical_torch_native(
     return labels, means, variances, weights, info
 
 
+@torch.no_grad()
 def batch_gmm_Diagonal_torch_native(
     x: torch.Tensor,
     n_components: int,
@@ -2480,6 +2482,7 @@ def batch_gmm_Diagonal_torch_native(
         )
 
     for iteration in range(max_iters):
+        collect_lower_bound = bool(tol > 0.0 or verbose or iteration + 1 == max_iters)
         variances = variances.clamp_min(reg_covar)
         weights = weights.clamp_min(min_weight)
         weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -2548,7 +2551,8 @@ def batch_gmm_Diagonal_torch_native(
                                 **fused_config,
                             )
                         )
-                        total_log_likelihood = total_log_likelihood + ll_tile
+                        if collect_lower_bound:
+                            total_log_likelihood = total_log_likelihood + ll_tile
                         nk += nk_tile
                         sum_x += sum_x_tile
                         sum_x_sq += sum_x_sq_tile
@@ -2585,7 +2589,8 @@ def batch_gmm_Diagonal_torch_native(
                         BLOCK_D=block_d,
                         BLOCK_K=block_k,
                     )
-                    total_log_likelihood = total_log_likelihood + log_norm.sum()
+                    if collect_lower_bound:
+                        total_log_likelihood = total_log_likelihood + log_norm.sum()
                     nk += nk_tile
                     sum_x += sum_x_tile
                     sum_x_sq += sum_x_sq_tile
@@ -2606,7 +2611,8 @@ def batch_gmm_Diagonal_torch_native(
                     mean_precision_mean_chunk=mean_precision_mean,
                 )
                 log_norm = torch.logsumexp(logits, dim=-1)
-                total_log_likelihood = total_log_likelihood + log_norm.sum()
+                if collect_lower_bound:
+                    total_log_likelihood = total_log_likelihood + log_norm.sum()
                 resp = logits.sub(log_norm.unsqueeze(-1)).exp_()
                 nk += resp.sum(dim=1)
                 sum_x += torch.bmm(resp.transpose(1, 2), x_chunk_f)
@@ -2625,7 +2631,8 @@ def batch_gmm_Diagonal_torch_native(
                 weighted_means=weighted_means,
                 mean_precision_mean=mean_precision_mean,
             )
-            total_log_likelihood = total_log_likelihood + log_norm.sum()
+            if collect_lower_bound:
+                total_log_likelihood = total_log_likelihood + log_norm.sum()
 
             for k_start in range(0, n_components, chunk_size_K):
                 k_end = min(k_start + chunk_size_K, n_components)
@@ -2658,14 +2665,26 @@ def batch_gmm_Diagonal_torch_native(
         weights_new = weights_new / weights_new.sum(dim=-1, keepdim=True)
         weights_new = weights_new.to(x.dtype)
 
-        lower_bound = (total_log_likelihood / float(bsz * n)).item()
-        lower_bound_history.append(lower_bound)
-        mean_shift = (means_new - means).norm(dim=-1).max().item()
-        var_shift = (variances_new.to(torch.float32) - variances.to(torch.float32)).abs().max().item()
+        lower_bound_tensor = (
+            total_log_likelihood / float(bsz * n)
+            if collect_lower_bound
+            else torch.zeros((), device=x.device, dtype=torch.float32)
+        )
+        need_lower_bound_host = bool(verbose or tol > 0.0)
+        lower_bound_value = (
+            float(lower_bound_tensor.item())
+            if need_lower_bound_host
+            else lower_bound_tensor.detach()
+        )
+        lower_bound_history.append(lower_bound_value)
 
         if verbose:
+            mean_shift = (means_new - means).norm(dim=-1).max().item()
+            var_shift = (
+                variances_new.to(torch.float32) - variances.to(torch.float32)
+            ).abs().max().item()
             print(
-                f"Iter {iteration}, lower_bound: {lower_bound:.6f}, "
+                f"Iter {iteration}, lower_bound: {float(lower_bound_value):.6f}, "
                 f"mean_shift: {mean_shift:.6f}, variance_shift: {var_shift:.6f}"
             )
 
@@ -2673,9 +2692,15 @@ def batch_gmm_Diagonal_torch_native(
         variances = variances_new
         weights = weights_new
 
-        if prev_lower_bound is not None and abs(lower_bound - prev_lower_bound) < tol:
+        if tol > 0.0 and prev_lower_bound is not None and abs(float(lower_bound_value) - prev_lower_bound) < tol:
             break
-        prev_lower_bound = lower_bound
+        if tol > 0.0:
+            prev_lower_bound = float(lower_bound_value)
+
+    if lower_bound_history and torch.is_tensor(lower_bound_history[0]):
+        lower_bound_history = [
+            float(value) for value in torch.stack(lower_bound_history).detach().cpu().tolist()
+        ]
 
     labels = (
         diagonal_assign_torch_native_chunked(
@@ -2703,6 +2728,7 @@ def batch_gmm_Diagonal_torch_native(
     return labels, means, variances, weights, info
 
 
+@torch.no_grad()
 def _batch_gmm_matrix_torch_native(
     x: torch.Tensor,
     n_components: int,
@@ -2836,6 +2862,7 @@ def _batch_gmm_matrix_torch_native(
             tied_total_xx += torch.bmm(x_chunk_f.transpose(1, 2), x_chunk_f)
 
     for iteration in range(max_iters):
+        collect_lower_bound = bool(tol > 0.0 or verbose or iteration + 1 == max_iters)
         weights = weights.clamp_min(min_weight)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         log_weights = torch.log(weights.to(torch.float32))
@@ -2944,7 +2971,8 @@ def _batch_gmm_matrix_torch_native(
                         BLOCK_D=block_d,
                         BLOCK_K=block_k,
                     )
-                    total_log_likelihood = total_log_likelihood + log_norm.sum()
+                    if collect_lower_bound:
+                        total_log_likelihood = total_log_likelihood + log_norm.sum()
                     nk += nk_tile
                     sum_x += sum_x_tile
                     sum_xx += sum_xx_tile
@@ -2969,7 +2997,8 @@ def _batch_gmm_matrix_torch_native(
                             partial_log_likelihood=None if tied_partial_buffers is None else tied_partial_buffers[2],
                             **tied_fused_config,
                         )
-                        total_log_likelihood = total_log_likelihood + ll_tile
+                        if collect_lower_bound:
+                            total_log_likelihood = total_log_likelihood + ll_tile
                         nk += nk_tile
                         sum_x += sum_x_tile
                         tied_triton_used = True
@@ -3008,11 +3037,12 @@ def _batch_gmm_matrix_torch_native(
                         BLOCK_D=block_d,
                         BLOCK_K=block_k,
                     )
-                    total_log_likelihood = (
-                        total_log_likelihood
-                        + log_norm.sum()
-                        - 0.5 * float(n_end - n_start) * logdet.sum()
-                    )
+                    if collect_lower_bound:
+                        total_log_likelihood = (
+                            total_log_likelihood
+                            + log_norm.sum()
+                            - 0.5 * float(n_end - n_start) * logdet.sum()
+                        )
                     nk += nk_tile
                     sum_x += sum_x_tile
                     tied_triton_used = True
@@ -3045,7 +3075,8 @@ def _batch_gmm_matrix_torch_native(
                         mean_precision_mean_chunk=mean_precision_mean,
                     )
                 log_norm = torch.logsumexp(logits, dim=-1)
-                total_log_likelihood = total_log_likelihood + log_norm.sum()
+                if collect_lower_bound:
+                    total_log_likelihood = total_log_likelihood + log_norm.sum()
                 resp = logits.sub(log_norm.unsqueeze(-1)).exp_()
                 nk += resp.sum(dim=1)
                 sum_x += torch.bmm(resp.transpose(1, 2), x_chunk_f)
@@ -3071,7 +3102,8 @@ def _batch_gmm_matrix_torch_native(
                 precision_means=precision_means,
                 mean_precision_mean=mean_precision_mean,
             )
-            total_log_likelihood = total_log_likelihood + log_norm.sum()
+            if collect_lower_bound:
+                total_log_likelihood = total_log_likelihood + log_norm.sum()
 
             for k_start in range(0, n_components, chunk_size_K):
                 k_end = min(k_start + chunk_size_K, n_components)
@@ -3124,29 +3156,36 @@ def _batch_gmm_matrix_torch_native(
                 covariances_new.to(x.dtype),
                 covariances,
             )
-            covariance_shift = (
-                covariances_new.to(torch.float32) - covariances.to(torch.float32)
-            ).abs().max().item()
         else:
             scatter = total_xx - (nk[..., None, None] * means_outer).sum(dim=1)
             covariances_new = scatter / float(n)
             covariances_new = (_symmetrize_matrix(covariances_new) + reg_covar * eye).to(x.dtype)
-            covariance_shift = (
-                covariances_new.to(torch.float32) - covariances.to(torch.float32)
-            ).abs().max().item()
 
         weights_new = nk / float(n)
         weights_new = weights_new.clamp_min(min_weight)
         weights_new = weights_new / weights_new.sum(dim=-1, keepdim=True)
         weights_new = weights_new.to(x.dtype)
 
-        lower_bound = (total_log_likelihood / float(bsz * n)).item()
-        lower_bound_history.append(lower_bound)
-        mean_shift = (means_new - means).norm(dim=-1).max().item()
+        lower_bound_tensor = (
+            total_log_likelihood / float(bsz * n)
+            if collect_lower_bound
+            else torch.zeros((), device=x.device, dtype=torch.float32)
+        )
+        need_lower_bound_host = bool(verbose or tol > 0.0)
+        lower_bound_value = (
+            float(lower_bound_tensor.item())
+            if need_lower_bound_host
+            else lower_bound_tensor.detach()
+        )
+        lower_bound_history.append(lower_bound_value)
 
         if verbose:
+            mean_shift = (means_new - means).norm(dim=-1).max().item()
+            covariance_shift = (
+                covariances_new.to(torch.float32) - covariances.to(torch.float32)
+            ).abs().max().item()
             print(
-                f"Iter {iteration}, lower_bound: {lower_bound:.6f}, "
+                f"Iter {iteration}, lower_bound: {float(lower_bound_value):.6f}, "
                 f"mean_shift: {mean_shift:.6f}, covariance_shift: {covariance_shift:.6f}"
             )
 
@@ -3154,9 +3193,15 @@ def _batch_gmm_matrix_torch_native(
         covariances = covariances_new
         weights = weights_new
 
-        if prev_lower_bound is not None and abs(lower_bound - prev_lower_bound) < tol:
+        if tol > 0.0 and prev_lower_bound is not None and abs(float(lower_bound_value) - prev_lower_bound) < tol:
             break
-        prev_lower_bound = lower_bound
+        if tol > 0.0:
+            prev_lower_bound = float(lower_bound_value)
+
+    if lower_bound_history and torch.is_tensor(lower_bound_history[0]):
+        lower_bound_history = [
+            float(value) for value in torch.stack(lower_bound_history).detach().cpu().tolist()
+        ]
 
     if not compute_labels:
         labels = None

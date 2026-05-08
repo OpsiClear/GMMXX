@@ -134,6 +134,42 @@ def test_gmmxx_spherical_cuda_approx_topk_training_uses_cuda():
     )
 
 
+def test_gmmxx_spherical_cuda_approx_topk_large_k_uses_cuda():
+    from gmmxx import GMMXX
+    from gmmxx._runtime import cuda_spherical_approx_topk_supported
+
+    assert cuda_spherical_approx_topk_supported(128, 4096, torch.float16, 8)
+    assert cuda_spherical_approx_topk_supported(128, 8192, torch.float16, 8)
+    assert not cuda_spherical_approx_topk_supported(128, 8193, torch.float16, 8)
+
+    torch.manual_seed(124)
+    x = torch.randn(512, 128, device="cuda", dtype=torch.float16)
+    model = GMMXX(
+        d=128,
+        k=4096,
+        niter=1,
+        tol=0.0,
+        seed=124,
+        init_params="random",
+        covariance_type="spherical",
+        backend="auto",
+        approx_top_k=8,
+        device=torch.device("cuda"),
+        compute_labels_on_fit=False,
+        chunk_size_centroids=1024,
+    ).fit(x)
+
+    assert model.last_backend_used_ == "cuda"
+    assert model.cuda_approx_topk_enabled_ is True
+    assert model.triton_approx_topk_enabled_ is False
+    assert model.approx_top_k_ == 8
+    assert model.means_b.shape == (1, 4096, 128)
+    assert model.labels_ is None
+    assert torch.isfinite(model.means_b).all()
+    assert torch.isfinite(model.covariances_b).all()
+    assert torch.isfinite(model.weights_b).all()
+
+
 def test_gmmxx_spherical_cuda_approx_topk_equal_k_uses_exact_cuda():
     from gmmxx import GMMXX
 
@@ -156,6 +192,39 @@ def test_gmmxx_spherical_cuda_approx_topk_equal_k_uses_exact_cuda():
     assert model.cuda_approx_topk_enabled_ is False
     assert model.approximate_em_enabled_ is False
     assert model.approx_top_k_ is None
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+def test_gmmxx_spherical_exact_large_k_uses_cuda(k):
+    from gmmxx import GMMXX
+    from gmmxx._runtime import cuda_spherical_supported
+
+    assert cuda_spherical_supported(128, k, torch.float16)
+
+    torch.manual_seed(125 + k)
+    x = torch.randn(256, 128, device="cuda", dtype=torch.float16)
+    model = GMMXX(
+        d=128,
+        k=k,
+        niter=1,
+        tol=0.0,
+        seed=125,
+        init_params="random",
+        covariance_type="spherical",
+        backend="cuda",
+        device=torch.device("cuda"),
+        dtype=torch.float16,
+        compute_labels_on_fit=False,
+    ).fit(x)
+
+    assert model.last_backend_used_ == "cuda"
+    assert model.cuda_approx_topk_enabled_ is False
+    assert model.approximate_em_enabled_ is False
+    assert model.means_b.shape == (1, k, 128)
+    assert model.labels_ is None
+    assert torch.isfinite(model.means_b).all()
+    assert torch.isfinite(model.covariances_b).all()
+    assert torch.isfinite(model.weights_b).all()
 
 
 def test_large_n_spherical_cuda_does_not_ignore_approx_topk():
