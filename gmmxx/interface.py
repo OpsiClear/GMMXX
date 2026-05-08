@@ -594,6 +594,42 @@ class GMMXX:
         self.last_backend_used_ = "cuda"
         self.cuda_estep_enabled_ = True
 
+    @staticmethod
+    def _build_spherical_caches(
+        x_b: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+        Optional[torch.Tensor], Optional[torch.Tensor],
+    ]:
+        """Build the loop-invariant tensor caches the spherical soft-EM
+        path consumes:
+          - x_f:                  (B, N, D) fp32 view of x_b
+          - x_sq:                 (B, N) fp32 row norms
+          - x_aug:                (B, N, D+2) fp32 = [x_f | x_sq | 1]
+          - x_estep_aug:          (B, N, D+1) fp32 = strided view of x_aug
+          - x_estep_aug_bf16:     (B, N, D+1) bf16 (only when D >= 64)
+          - x_aug_bf16:           (B, N, D+2) bf16 (only when D >= 64)
+
+        x_aug is contiguous; x_estep_aug is the same storage minus the
+        trailing ones column. The bf16 caches halve E-step / M-step
+        cuBLAS read BW vs fp32 (HMMA with fp32 accumulator).
+        """
+        D = int(x_b.shape[-1])
+        x_f = x_b.float() if x_b.dtype != torch.float32 else x_b
+        x_sq = x_f.square().sum(dim=-1)
+        ones_col = torch.ones(
+            (x_f.shape[0], x_f.shape[1], 1),
+            dtype=torch.float32, device=x_f.device,
+        )
+        x_aug = torch.cat([x_f, x_sq.unsqueeze(-1), ones_col], dim=-1).contiguous()
+        x_estep_aug = x_aug[:, :, :-1]
+        x_estep_aug_bf16: Optional[torch.Tensor] = None
+        x_aug_bf16: Optional[torch.Tensor] = None
+        if D >= 64:
+            x_estep_aug_bf16 = x_estep_aug.to(torch.bfloat16).contiguous()
+            x_aug_bf16 = x_aug.to(torch.bfloat16).contiguous()
+        return x_f, x_sq, x_aug, x_estep_aug, x_estep_aug_bf16, x_aug_bf16
+
     def _run_streamed_cuda_tensor_fit(
         self,
         covariance_type: str,
@@ -696,8 +732,8 @@ class GMMXX:
         lb = float("-inf")
         ids: Optional[torch.Tensor] = None
 
-        # Hoist x.float() and |x|^2 out of the EM loop — both depend only on
-        # x and otherwise get recomputed every iteration inside soft_update.
+        # Build the loop-invariant tensor caches for the soft-update path.
+        # The native-blocked / fused-cuda paths don't need these.
         x_f_cached: Optional[torch.Tensor] = None
         x_sq_cached: Optional[torch.Tensor] = None
         x_aug_cached: Optional[torch.Tensor] = None
@@ -705,39 +741,10 @@ class GMMXX:
         x_estep_aug_bf16_cached: Optional[torch.Tensor] = None
         x_aug_bf16_cached: Optional[torch.Tensor] = None
         if use_soft_update:
-            x_f_cached = x_b.float() if x_b.dtype != torch.float32 else x_b
-            x_sq_cached = x_f_cached.square().sum(dim=-1)
-            # Pre-concatenate x_f, x_sq, and ones into (B, N, D+2) once for
-            # the augmented bmm M-step path. The trailing ones column lets
-            # us read nk = sum(resp) from the same GEMM.
-            ones_col = torch.ones(
-                (x_f_cached.shape[0], x_f_cached.shape[1], 1),
-                dtype=torch.float32, device=x_f_cached.device,
+            (x_f_cached, x_sq_cached, x_aug_cached, x_estep_aug_cached,
+             x_estep_aug_bf16_cached, x_aug_bf16_cached) = (
+                self._build_spherical_caches(x_b)
             )
-            x_aug_cached = torch.cat(
-                [x_f_cached, x_sq_cached.unsqueeze(-1), ones_col], dim=-1
-            ).contiguous()
-            # E-step augmented input: (B, N, D+1) = [x_f | x_sq]. The first
-            # D+1 cols of x_aug are exactly [x_f | x_sq], so we take a
-            # strided slice instead of building a second N*(D+1)*4 tensor.
-            # Saves ~270 MB write at fit setup for the D=128 bench shape and
-            # a corresponding cat launch. cuBLAS GEMM on a strided 2D tensor
-            # (lda = D+2, cols = D+1) is equally fast.
-            x_estep_aug_cached = x_aug_cached[:, :, :-1]
-            # For D >= 64, the E-step GEMM is bandwidth-bound at fp32. Pre-
-            # cast a bf16 copy; cuBLAS HMMA with fp32 accumulator halves
-            # the input BW and uses bf16 tensor cores (2x throughput vs TF32).
-            if D >= 64:
-                x_estep_aug_bf16_cached = (
-                    x_estep_aug_cached.to(torch.bfloat16).contiguous()
-                )
-                # Also pre-cast the (B, N, D+2) x_aug as bf16 for the
-                # persistent-CTA Triton kernel's M-step partial GEMM. The
-                # kernel does tl.dot(bf16, bf16) with fp32 accumulator,
-                # halving the x_aug read BW vs fp32 (276 MB -> 138 MB at the
-                # D=128 bench shape). End-to-end persistent-kernel time
-                # 0.95 ms -> 0.46 ms (2x).
-                x_aug_bf16_cached = x_aug_cached.to(torch.bfloat16).contiguous()
 
         # Pre-allocate the persistent kernel's per-CTA partial buffer so the
         # inner soft_update_spherical call doesn't allocate it on every iter.
