@@ -9,8 +9,11 @@ import torch
 
 from ._runtime import (
     cuda_diag_streamed_supported,
+    cuda_diag_supported,
     cuda_full_streamed_supported,
+    cuda_full_supported,
     cuda_tied_streamed_supported,
+    cuda_tied_supported,
     triton_spherical_supported,
 )
 
@@ -494,24 +497,18 @@ class GMMXX:
             path takes over at K = 128 even when native still fits.
         """
         backend = self.backend
-        if backend == "auto":
-            env_backend = os.environ.get("GMMXX_BACKEND")
-            if env_backend in {"cuda", "auto"}:
-                pass  # streamed-cuda is allowed
-            elif env_backend in {"triton", "torch"}:
-                return False
         if backend not in {"auto", "cuda"}:
             return False
+        if backend == "auto":
+            # GMMXX_BACKEND env var can pin the resolver to non-cuda; honor it.
+            env_backend = os.environ.get("GMMXX_BACKEND")
+            if env_backend in {"triton", "torch"}:
+                return False
         if self.approx_top_k is not None:
             return False
         if not x_b.is_cuda:
             return False
         d = int(x_b.shape[-1])
-        from ._runtime import (
-            cuda_diag_supported,
-            cuda_tied_supported,
-            cuda_full_supported,
-        )
         if covariance_type == "diag":
             if not cuda_diag_streamed_supported(d, self.k, x_b.dtype):
                 return False
