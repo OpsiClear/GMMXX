@@ -295,16 +295,16 @@ Measured on RTX 4090, Python 3.12, `torch 2.11.0+cu130`, `sklearn 1.8.0`, 20 EM 
 
 | cov | N | D | K | dtype | sklearn | gmmxx (cuda) | speedup | backend |
 |---|---|---|---|---|---|---|---|---|
-| spherical | N= 16,384 | D= 32 | K=  64 | fp16 |    1132 ms |       6 ms | **182x** | cuda |
-| spherical | N= 65,536 | D= 32 | K=  64 | fp16 |    4183 ms |       7 ms | **613x** | cuda |
-| spherical | N=131,072 | D=128 | K=  64 | fp32 |   10442 ms |       8 ms | **1333x** | cuda |
-| spherical | N=131,072 | D= 16 | K=  32 | fp16 |    4059 ms |      15 ms | **276x** | cuda |
-| diag | N= 16,384 | D= 32 | K=  64 | fp32 |    1159 ms |      15 ms | **75x** | cuda |
-| diag | N= 65,536 | D= 32 | K=  64 | fp32 |    4049 ms |       9 ms | **429x** | cuda |
-| tied | N= 16,384 | D= 32 | K=  64 | fp32 |    5933 ms |      40 ms | **147x** | cuda |
-| tied | N= 65,536 | D= 32 | K=  64 | fp32 |   23229 ms |      29 ms | **788x** | cuda |
-| full | N= 16,384 | D= 16 | K=  32 | fp32 |    3898 ms |      33 ms | **118x** | cuda |
-| full | N= 65,536 | D= 16 | K=  32 | fp32 |   12929 ms |     141 ms | **92x** | cuda |
+| spherical | N= 16,384 | D= 32 | K=  64 | fp16 |    1200 ms |       5 ms | **223x** | cuda |
+| spherical | N= 65,536 | D= 32 | K=  64 | fp16 |    4231 ms |      12 ms | **358x** | cuda |
+| spherical | N=131,072 | D=128 | K=  64 | fp32 |   10004 ms |       8 ms | **1285x** | cuda |
+| spherical | N=131,072 | D= 16 | K=  32 | fp16 |    4216 ms |       4 ms | **1002x** | cuda |
+| diag | N= 16,384 | D= 32 | K=  64 | fp32 |     967 ms |      11 ms | **91x** | cuda |
+| diag | N= 65,536 | D= 32 | K=  64 | fp32 |    3785 ms |      25 ms | **152x** | cuda |
+| tied | N= 16,384 | D= 32 | K=  64 | fp32 |    5851 ms |      17 ms | **350x** | cuda |
+| tied | N= 65,536 | D= 32 | K=  64 | fp32 |   23373 ms |      19 ms | **1229x** | cuda |
+| full | N= 16,384 | D= 16 | K=  32 | fp32 |    4207 ms |      19 ms | **222x** | cuda |
+| full | N= 65,536 | D= 16 | K=  32 | fp32 |   12908 ms |      21 ms | **623x** | cuda |
 
 The `default` grid is sized so each sklearn fit completes in under ~60 seconds. At larger shapes — the kind a CUDA backend is built for — sklearn fits become impractical (minutes per iter). gmmxx's wall clock at those shapes:
 

@@ -1069,19 +1069,47 @@ class GMMXX:
         lb = float("-inf")
         ids: Optional[torch.Tensor] = None
 
+        # Tied = spherical (σ²=1) in projected coords y = L⁻¹ x. The SIMT
+        # tied_logsumexp/tied_resp kernels project internally and call SIMT
+        # spherical kernels that don't benefit from the cuBLAS augmented-GEMM
+        # path used by _train_spherical_cuda. We skip them entirely here.
+        # Logit (softmax-equivalent): α_k + y_n · m_k where
+        #   m_k = L⁻¹ μ_k, α_k = log w_k - 0.5 ||m_k||² - log|L| - 0.5 D log(2π)
+        # Full lse adds the (k-independent) -0.5 ||y_n||² term back.
         skip_lb_per_iter = (self.tol == 0)
         last_iter = self.niter - 1
+        half_D_log2pi = 0.5 * float(D) * math.log(2.0 * math.pi)
+        x_t_f = x_b_f.transpose(-1, -2).contiguous()  # (B, D, N) reused each iter
         for it in range(self.niter):
             n_iter += 1
-            lse = _cuda_mod.tied_logsumexp(x_b, means, L, log_w)
             need_lb = (not skip_lb_per_iter) or (it == last_iter)
+
+            L_f = L.float()
+            # Project x and means: solve L · ?ᵀ = inputᵀ.
+            y = torch.linalg.solve_triangular(L_f, x_t_f, upper=False).transpose(-1, -2).contiguous()  # (B, N, D)
+            m = torch.linalg.solve_triangular(
+                L_f, means.float().transpose(-1, -2), upper=False
+            ).transpose(-1, -2).contiguous()  # (B, K, D)
+
+            log_det_L = L_f.diagonal(dim1=-2, dim2=-1).log().sum(-1)  # (B,)
+            m_sq = m.pow(2).sum(-1)  # (B, K)
+            alpha = log_w - 0.5 * m_sq - log_det_L.unsqueeze(-1) - half_D_log2pi
+
+            if B == 1:
+                logits = torch.addmm(alpha[0], y[0], m[0].t()).unsqueeze(0)
+            else:
+                logits = alpha.unsqueeze(1) + torch.matmul(y, m.transpose(-1, -2))
+
             if need_lb:
+                y_sq_half = 0.5 * y.pow(2).sum(-1)  # (B, N)
+                lse = (logits - y_sq_half.unsqueeze(-1)).logsumexp(dim=-1)
                 lb = float(lse.mean().item())
                 lower_bound_history.append(lb)
             else:
                 lower_bound_history.append(0.0)
 
-            resp = _cuda_mod.tied_resp(x_b, means, L, log_w, lse)
+            # softmax(logits + const_n) == softmax(logits), so y_sq term drops.
+            resp = torch.softmax(logits, dim=-1)
             counts = resp.sum(dim=1)
             sums = torch.bmm(resp.transpose(1, 2), x_b_f)
             means, L, weights = _cuda_mod.tied_finalize(
@@ -1154,22 +1182,57 @@ class GMMXX:
         lb = float("-inf")
         ids: Optional[torch.Tensor] = None
 
+        # Full-cov via cuBLAS GEMMs in vectorized outer-product space.
+        # Both the E-step Mahalanobis distance and the M-step outer-sum
+        # accumulator become inner products against vec(x x^T), letting
+        # us replace the SIMT full_logsumexp / full_resp kernels and the
+        # bnk,bnd,bne einsum with batched matmuls.
+        #   logit[n,k] = α_k - 0.5 (Q · vec(Σ_k^{-1})) + x_n · m_k
+        #     where  Q[n] = vec(x_n x_n^T)         (B, N, D²)
+        #            m_k = Σ_k^{-1} μ_k             (B, K, D)
+        #            α_k = log w_k - log|L_k| - 0.5 D log(2π) - 0.5 μ_k·m_k
+        #   outer_sums[k] = Σ_n r_{n,k} x_n x_n^T = (resp.T @ Q).view(K, D, D)
         skip_lb_per_iter = (self.tol == 0)
         last_iter = self.niter - 1
+        half_D_log2pi = 0.5 * float(D) * math.log(2.0 * math.pi)
+        # Precompute vec(x_n x_n^T) once — constant across iterations.
+        xx_outer_flat = (
+            x_b_f.unsqueeze(-1) * x_b_f.unsqueeze(-2)
+        ).reshape(B, N, D * D).contiguous()  # (B, N, D²)
+
         for it in range(self.niter):
             n_iter += 1
-            lse = _cuda_mod.full_logsumexp(x_b, means, L, log_w)
             need_lb = (not skip_lb_per_iter) or (it == last_iter)
+
+            L_f = L.float()
+            sigma_inv = torch.cholesky_inverse(
+                L_f.reshape(B * K, D, D)
+            ).reshape(B, K, D, D)
+            sigma_inv_vec = sigma_inv.reshape(B, K, D * D)
+
+            means_f = means.float()
+            m = torch.matmul(sigma_inv, means_f.unsqueeze(-1)).squeeze(-1)  # (B, K, D)
+            mu_dot_m = (means_f * m).sum(-1)                                # (B, K)
+            log_det_L = L_f.diagonal(dim1=-2, dim2=-1).log().sum(-1)        # (B, K)
+            alpha = log_w - log_det_L - half_D_log2pi - 0.5 * mu_dot_m
+
+            bilinear = torch.matmul(xx_outer_flat, sigma_inv_vec.transpose(-1, -2))  # (B, N, K)
+            linear = torch.matmul(x_b_f, m.transpose(-1, -2))                        # (B, N, K)
+            logits = alpha.unsqueeze(1) - 0.5 * bilinear + linear
+
             if need_lb:
+                lse = logits.logsumexp(dim=-1)
                 lb = float(lse.mean().item())
                 lower_bound_history.append(lb)
             else:
                 lower_bound_history.append(0.0)
 
-            resp = _cuda_mod.full_resp(x_b, means, L, log_w, lse)
+            resp = torch.softmax(logits, dim=-1)
             counts = resp.sum(dim=1)
-            sums = torch.bmm(resp.transpose(1, 2), x_b_f)
-            outer_sums = torch.einsum("bnk,bnd,bne->bkde", resp, x_b_f, x_b_f)
+            sums = torch.bmm(resp.transpose(1, 2), x_b_f)                            # (B, K, D)
+            outer_sums = torch.bmm(
+                resp.transpose(1, 2), xx_outer_flat
+            ).reshape(B, K, D, D)                                                    # (B, K, D, D)
             means, L, weights = _cuda_mod.full_finalize(
                 sums, outer_sums, counts, means, L, N, self.reg_covar
             )
